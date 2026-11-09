@@ -62,8 +62,30 @@ A powerful, responsive desktop project management and Kanban application built w
   - Activity timeline with **All / Comments / History** filters and "View changes" diffs for description and comment edits.
   - 📎 / 💬 counters on task cards; the analytics activity table shows who made each change.
 
+- **Pomodoro & Live Stopwatch Timer**
+  - Start a **stopwatch** or a **Pomodoro** from a card's right-click menu or the task's **Time** tab.
+  - A live timer in the status bar shows elapsed/remaining time and the task; you can pause, stop, skip a break, or discard the session there, and clicking the task name opens the task.
+  - Pomodoro focus sessions are logged to the task and breaks are not. After a focus session a break starts (every Nth break is a long one), and when the break ends the next focus session waits for you. Lengths are configurable (⚙ → Pomodoro settings).
+  - Timers survive restarts and crashes: a running timer is stored in the database and resumes on the next launch. When you close the app while tracking, it asks whether to stop and log the time or keep it running. Runs shorter than 30 s are treated as accidental and not logged.
+  - The Time tab also takes manual entries ("1h 30m", "90m", "1.5", "1:30"), and you can edit or delete your own entries. Cards show logged vs. estimate (`⏱ 2.5/5h`, red when over) and a **● Tracking** badge while a timer runs.
+  - Every logged, edited or deleted entry appears in the task's audit trail.
+
+- **Workload & Capacity Planning View** (👥 Workload)
+  - A person × week (or day) grid of planned work vs. capacity, for the current board or the whole workspace.
+  - Each open task's *remaining* effort (estimate minus time logged) is spread over the assignee's working days up to its due date; overdue work lands on today. Capacity only counts days from today onward.
+  - Cells are colour-coded (under 80% / 80-100% / over capacity) and also show time actually logged. A summary lists overloads, unassigned work and unestimated tasks.
+  - Click a cell to see the tasks behind it; double-click one to open it, or right-click to **reassign** it (the menu shows each person's load).
+  - **Team & Capacity** sets each person's weekly hours and working days (part-timers included). Tasks have an **Assignee** field in the task editor and an avatar on the card.
+
+- **Timesheet Exporting** (Workload → Export Timesheet)
+  - Pick a period (this/last week, this/last month, last 30 days or a custom range), a scope (board, workspace or everything) and a person, then preview entries or totals by day, task or person.
+  - **CSV (entries)**: one row per time entry, with date, start/end, duration, decimal hours, person, workspace, board, task, labels, source and note.
+  - **Summary CSV**: person × task rows with one column per day, plus totals.
+  - **PDF**: a printable report grouped by person with daily subtotals.
+  - Times are in local time. CSVs are UTF-8 with a BOM (opens cleanly in Excel), and cells that could be read as spreadsheet formulas are escaped.
+
 - **Demo Board ("Feature Tour")**
-  - New databases include a guided demo board with rich descriptions, inline images, file attachments, comment threads and a realistic history.
+  - New databases include a guided demo board with rich descriptions, inline images, file attachments, comment threads and a realistic history, plus a small team with capacities, assignees and two weeks of logged time (one teammate is deliberately over capacity).
   - Add another any time with **✨ Add Demo Board** in the sidebar (or a workspace's right-click menu).
 
 - **Multiple Views**
@@ -71,12 +93,13 @@ A powerful, responsive desktop project management and Kanban application built w
   - **Calendar View**: Month/week interactive calendar with due date chips and quick edit.
   - **Timeline / Gantt View**: Time-scaled task duration spans with dependency connector links.
   - **Analytics Dashboard**: WIP utilization, velocity metrics, completion rates, bottleneck alerts, and activity logs.
+  - **Workload View**: team capacity planning and timesheet export (see above).
 
 - **Local Data Storage & Backups**
   - Local SQLite database with Foreign Key constraints and WAL mode via SQLAlchemy ORM.
   - Automated and manual point-in-time database snapshots (`.db` files).
   - One-click database restoration with automatic safety snapshots.
-  - Structured JSON export and import for data portability (format 1.1 also carries comments, attachments and task history; 1.0 files still import).
+  - Structured JSON export and import for data portability (format 1.2 also carries comments, attachments, task history, assignees, time entries and team capacity; 1.0/1.1 files still import).
   - Snapshots also mirror attachment files into `backups/attachments/`, and restores bring back any missing ones.
 
 ---
@@ -117,7 +140,7 @@ Data lives in `~/.kanban_manager/` (override with `KANBAN_DATA_DIR`):
 | `kanban_attachments/` | Attachment files (content-addressed, next to the database they belong to) |
 | `backups/` | Database snapshots, plus `backups/attachments/` with their attachment files |
 
-Comments and history entries are attributed to your OS login name. Set `KANBAN_USER="Your Name"` to use a different display name.
+Comments, history entries and tracked time are attributed to your OS login name. Set `KANBAN_USER="Your Name"` to use a different display name (use the same name you assign tasks to, so the workload view matches logged time to people).
 
 Databases from earlier versions are upgraded automatically on startup, and so are restored snapshots.
 
@@ -141,3 +164,4 @@ uv run pytest -v
 - `Right-click Card / Column`: Open contextual action menu
 - In the description editor: `Ctrl + B` bold, `Ctrl + I` italic, `Ctrl + E` inline code, `Ctrl + K` link
 - In the comment box: `Ctrl + Enter` to post
+- Right-click a card: Start Stopwatch / Start Pomodoro / Stop Timer

@@ -55,6 +55,9 @@ _ACTION_ICONS = {
     ActivityAction.DEPENDENCY_ADDED.value: "🔗",
     ActivityAction.DEPENDENCY_REMOVED.value: "🔗",
     ActivityAction.REMINDER_SET.value: "⏰",
+    ActivityAction.TIME_LOGGED.value: "⏱",
+    ActivityAction.TIME_ENTRY_UPDATED.value: "⏱",
+    ActivityAction.TIME_ENTRY_DELETED.value: "⏱",
 }
 
 # Field edits whose old/new text is worth showing as a diff
@@ -110,7 +113,7 @@ def avatar_color(name: str) -> str:
     return _AVATAR_COLORS[sum(ord(c) for c in (name or "?")) % len(_AVATAR_COLORS)]
 
 
-def _initials(name: str) -> str:
+def initials(name: str) -> str:
     parts = [p for p in (name or "?").split() if p]
     if not parts:
         return "?"
@@ -333,7 +336,7 @@ class ActivityPanel(QWidget):
 
     # ------------------------------------------------------------------
     def _avatar(self, name: str, size: int) -> QLabel:
-        lbl = QLabel(_initials(name))
+        lbl = QLabel(initials(name))
         lbl.setFixedSize(size, size)
         lbl.setAlignment(Qt.AlignCenter)
         lbl.setStyleSheet(

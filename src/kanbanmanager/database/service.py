@@ -11,7 +11,11 @@ from typing import Iterable, Iterator, List, Optional, Dict, Any, Set, Tuple
 
 from sqlalchemy.orm import Session, joinedload
 
-from kanbanmanager.config import get_current_user
+from kanbanmanager.config import (
+    DEFAULT_WEEKLY_CAPACITY_HOURS,
+    DEFAULT_WORKING_DAYS,
+    get_current_user,
+)
 from kanbanmanager.database.attachments import AttachmentError, guess_content_type
 from kanbanmanager.database.audit import diff_snapshots, snapshot_task
 from kanbanmanager.database.connection import DatabaseManager, get_db_manager
@@ -26,9 +30,13 @@ from kanbanmanager.database.models import (
     ActivityLog,
     Comment,
     Attachment,
+    TimeEntry,
+    TeamMember,
+    AppSetting,
     utc_now,
 )
-from kanbanmanager.enums import Priority, ColumnType, DependencyType, ActivityAction
+from kanbanmanager.timefmt import format_duration
+from kanbanmanager.enums import Priority, ColumnType, DependencyType, ActivityAction, TimeEntrySource
 
 
 def _snippet(text: str, limit: int = 80) -> str:
@@ -423,6 +431,7 @@ class DatabaseService:
         custom_fields: Optional[Dict[str, Any]] = None,
         is_recurring: bool = False,
         recurrence_rule: Optional[Dict[str, Any]] = None,
+        assignee: Optional[str] = None,
     ) -> Task:
         with self.db.session_scope() as session:
             # Check target column if done column
@@ -447,6 +456,7 @@ class DatabaseService:
                 custom_fields_json=json.dumps(custom_fields or {}),
                 is_recurring=is_recurring,
                 recurrence_rule_json=json.dumps(recurrence_rule or {}),
+                assignee=(assignee or "").strip() or None,
             )
 
             if label_ids:
@@ -484,6 +494,9 @@ class DatabaseService:
                 return col.name if col else ""
 
             before = snapshot_task(task, column_name(task.column_id))
+
+            if "assignee" in kwargs:
+                kwargs["assignee"] = (kwargs["assignee"] or "").strip() or None
 
             for key, value in kwargs.items():
                 if key == "checklist" and isinstance(value, list):
@@ -1047,3 +1060,290 @@ class DatabaseService:
             _ = board.columns
             _ = board.labels
             return board
+
+    # -------------------------------------------------------------------------
+    # TIME TRACKING
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _recompute_spent_hours(session: Session, task_id: int) -> None:
+        total = sum(
+            int(d or 0)
+            for (d,) in session.query(TimeEntry.duration_seconds)
+            .filter(TimeEntry.task_id == task_id, TimeEntry.ended_at.isnot(None))
+            .all()
+        )
+        task = session.get(Task, task_id)
+        if task is not None:
+            task.spent_hours = total / 3600.0
+
+    def _time_entry_dict(self, entry: TimeEntry) -> Dict[str, Any]:
+        data = entry.to_dict()
+        task = entry.task
+        data["task_title"] = task.title if task else ""
+        data["board_id"] = task.board_id if task else None
+        data["board_name"] = task.board.name if task and task.board else ""
+        data["workspace_name"] = task.board.workspace.name if task and task.board and task.board.workspace else ""
+        data["labels"] = [l.name for l in task.labels] if task else []
+        data["assignee"] = (task.assignee or "") if task else ""
+        return data
+
+    def get_running_time_entry(self, user: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """The open (running) entry for ``user`` (default: current actor), if any."""
+        with self.db.session_scope() as session:
+            entry = (
+                session.query(TimeEntry)
+                .filter(TimeEntry.ended_at.is_(None), TimeEntry.user == (user or self.actor))
+                .order_by(TimeEntry.started_at.desc())
+                .first()
+            )
+            return self._time_entry_dict(entry) if entry else None
+
+    def start_time_entry(
+        self,
+        task_id: int,
+        source: str = TimeEntrySource.STOPWATCH.value,
+        planned_seconds: Optional[int] = None,
+        started_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Start tracking time on a task. Any timer already running for this user is stopped first
+        (one person can only work on one thing at a time)."""
+        running = self.get_running_time_entry()
+        if running:
+            self.stop_time_entry(running["id"])
+        with self.db.session_scope() as session:
+            if session.get(Task, task_id) is None:
+                raise ValueError(f"Task {task_id} not found")
+            entry = TimeEntry(
+                task_id=task_id,
+                user=self.actor,
+                started_at=started_at or utc_now(),
+                source=source,
+                planned_seconds=planned_seconds,
+            )
+            session.add(entry)
+            session.flush()
+            return self._time_entry_dict(entry)
+
+    def stop_time_entry(
+        self,
+        entry_id: Optional[int] = None,
+        ended_at: Optional[datetime] = None,
+        min_seconds: int = 0,
+        note: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Finish a running entry (default: the current user's). Entries shorter than
+        ``min_seconds`` are discarded and None is returned."""
+        with self.db.session_scope() as session:
+            q = session.query(TimeEntry).filter(TimeEntry.ended_at.is_(None))
+            q = q.filter(TimeEntry.id == entry_id) if entry_id else q.filter(TimeEntry.user == self.actor)
+            entry = q.order_by(TimeEntry.started_at.desc()).first()
+            if entry is None:
+                return None
+            end = ended_at or utc_now()
+            seconds = max(0, int((end - entry.started_at).total_seconds()))
+            if seconds < min_seconds:
+                session.delete(entry)
+                return None
+            entry.ended_at = end
+            entry.duration_seconds = seconds
+            if note:
+                entry.note = note
+            self._recompute_spent_hours(session, entry.task_id)
+            source = TimeEntrySource(entry.source).display_name if entry.source in TimeEntrySource._value2member_map_ else entry.source
+            self._log(session, entry.task.board_id, entry.task_id, ActivityAction.TIME_LOGGED,
+                      f"Logged {format_duration(seconds)} ({source.lower()})",
+                      field_name="time", new_value=str(seconds))
+            session.flush()
+            return self._time_entry_dict(entry)
+
+    def discard_running_time_entry(self, entry_id: int) -> bool:
+        with self.db.session_scope() as session:
+            entry = session.get(TimeEntry, entry_id)
+            if entry is None or entry.ended_at is not None:
+                return False
+            session.delete(entry)
+            return True
+
+    def add_time_entry(
+        self,
+        task_id: int,
+        duration_seconds: int,
+        started_at: Optional[datetime] = None,
+        note: str = "",
+        user: Optional[str] = None,
+        source: str = TimeEntrySource.MANUAL.value,
+    ) -> Dict[str, Any]:
+        """Log time after the fact. ``started_at`` is naive UTC (defaults to now - duration)."""
+        duration_seconds = int(duration_seconds or 0)
+        if duration_seconds <= 0:
+            raise ValueError("Duration must be positive")
+        if duration_seconds > 24 * 3600:
+            raise ValueError("A single entry cannot exceed 24 hours")
+        start = started_at or (utc_now() - timedelta(seconds=duration_seconds))
+        with self.db.session_scope() as session:
+            task = session.get(Task, task_id)
+            if task is None:
+                raise ValueError(f"Task {task_id} not found")
+            entry = TimeEntry(
+                task_id=task_id,
+                user=user or self.actor,
+                started_at=start,
+                ended_at=start + timedelta(seconds=duration_seconds),
+                duration_seconds=duration_seconds,
+                source=source,
+                note=(note or "").strip() or None,
+            )
+            session.add(entry)
+            session.flush()
+            self._recompute_spent_hours(session, task_id)
+            self._log(session, task.board_id, task_id, ActivityAction.TIME_LOGGED,
+                      f"Logged {format_duration(duration_seconds)} (manual)"
+                      + (f": {_snippet(note, 60)}" if note and note.strip() else ""),
+                      field_name="time", new_value=str(duration_seconds))
+            return self._time_entry_dict(entry)
+
+    def update_time_entry(
+        self,
+        entry_id: int,
+        duration_seconds: Optional[int] = None,
+        started_at: Optional[datetime] = None,
+        note: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        with self.db.session_scope() as session:
+            entry = session.get(TimeEntry, entry_id)
+            if entry is None or entry.ended_at is None:
+                return None
+            old = int(entry.duration_seconds or 0)
+            if started_at is not None:
+                entry.started_at = started_at
+            if duration_seconds is not None:
+                if int(duration_seconds) <= 0:
+                    raise ValueError("Duration must be positive")
+                entry.duration_seconds = int(duration_seconds)
+            entry.ended_at = entry.started_at + timedelta(seconds=int(entry.duration_seconds))
+            if note is not None:
+                entry.note = note.strip() or None
+            self._recompute_spent_hours(session, entry.task_id)
+            if old != entry.duration_seconds:
+                details = f"Changed a time entry from {format_duration(old)} to {format_duration(entry.duration_seconds)}"
+            else:
+                details = "Edited a time entry"
+            self._log(session, entry.task.board_id, entry.task_id, ActivityAction.TIME_ENTRY_UPDATED, details,
+                      field_name="time", old_value=str(old), new_value=str(entry.duration_seconds))
+            session.flush()
+            return self._time_entry_dict(entry)
+
+    def delete_time_entry(self, entry_id: int) -> bool:
+        with self.db.session_scope() as session:
+            entry = session.get(TimeEntry, entry_id)
+            if entry is None:
+                return False
+            task_id, board_id = entry.task_id, entry.task.board_id
+            seconds, running = int(entry.duration_seconds or 0), entry.ended_at is None
+            session.delete(entry)
+            session.flush()
+            self._recompute_spent_hours(session, task_id)
+            if not running:
+                self._log(session, board_id, task_id, ActivityAction.TIME_ENTRY_DELETED,
+                          f"Deleted a time entry of {format_duration(seconds)}",
+                          field_name="time", old_value=str(seconds))
+            return True
+
+    def get_time_entries(
+        self,
+        task_id: Optional[int] = None,
+        board_ids: Optional[List[int]] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        user: Optional[str] = None,
+        include_running: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Time entries, oldest first. ``start``/``end`` are naive-UTC bounds on ``started_at`` (end exclusive)."""
+        with self.db.session_scope() as session:
+            q = session.query(TimeEntry).options(
+                joinedload(TimeEntry.task).joinedload(Task.board).joinedload(Board.workspace),
+                joinedload(TimeEntry.task).joinedload(Task.labels),
+            )
+            if task_id is not None:
+                q = q.filter(TimeEntry.task_id == task_id)
+            if board_ids is not None:
+                if not board_ids:
+                    return []
+                q = q.join(Task, Task.id == TimeEntry.task_id).filter(Task.board_id.in_(board_ids))
+            if start is not None:
+                q = q.filter(TimeEntry.started_at >= start)
+            if end is not None:
+                q = q.filter(TimeEntry.started_at < end)
+            if user is not None:
+                q = q.filter(TimeEntry.user == user)
+            if not include_running:
+                q = q.filter(TimeEntry.ended_at.isnot(None))
+            return [self._time_entry_dict(e) for e in q.order_by(TimeEntry.started_at, TimeEntry.id).all()]
+
+    # -------------------------------------------------------------------------
+    # TEAM & CAPACITY
+    # -------------------------------------------------------------------------
+    def get_team_members(self) -> List[Dict[str, Any]]:
+        with self.db.session_scope() as session:
+            return [m.to_dict() for m in session.query(TeamMember).order_by(TeamMember.name).all()]
+
+    def upsert_team_member(
+        self,
+        name: str,
+        weekly_capacity_hours: Optional[float] = None,
+        working_days: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("Name is required")
+        if weekly_capacity_hours is not None and not (0 <= weekly_capacity_hours <= 168):
+            raise ValueError("Weekly capacity must be between 0 and 168 hours")
+        with self.db.session_scope() as session:
+            member = session.query(TeamMember).filter(TeamMember.name == name).first()
+            if member is None:
+                member = TeamMember(name=name, weekly_capacity_hours=DEFAULT_WEEKLY_CAPACITY_HOURS)
+                member.working_days = list(DEFAULT_WORKING_DAYS)
+                session.add(member)
+            if weekly_capacity_hours is not None:
+                member.weekly_capacity_hours = float(weekly_capacity_hours)
+            if working_days is not None:
+                member.working_days = working_days
+            session.flush()
+            return member.to_dict()
+
+    def delete_team_member(self, name: str) -> bool:
+        with self.db.session_scope() as session:
+            member = session.query(TeamMember).filter(TeamMember.name == name).first()
+            if member is None:
+                return False
+            session.delete(member)  # tasks keep their assignee text; capacity falls back to the default
+            return True
+
+    def get_people(self) -> List[str]:
+        """Everyone who can be assigned: team members, existing assignees, and the current user."""
+        with self.db.session_scope() as session:
+            names = {n for (n,) in session.query(TeamMember.name).all()}
+            names |= {n for (n,) in session.query(Task.assignee).filter(Task.assignee.isnot(None)).distinct().all()}
+        names.add(self.actor)
+        return sorted((n for n in names if n and n.strip()), key=str.lower)
+
+    # -------------------------------------------------------------------------
+    # SETTINGS
+    # -------------------------------------------------------------------------
+    def get_setting(self, key: str, default: Any = None) -> Any:
+        with self.db.session_scope() as session:
+            row = session.get(AppSetting, key)
+            if row is None:
+                return default
+            try:
+                return json.loads(row.value)
+            except (TypeError, ValueError):
+                return default
+
+    def set_setting(self, key: str, value: Any) -> None:
+        with self.db.session_scope() as session:
+            row = session.get(AppSetting, key)
+            if row is None:
+                session.add(AppSetting(key=key, value=json.dumps(value)))
+            else:
+                row.value = json.dumps(value)

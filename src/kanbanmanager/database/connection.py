@@ -22,6 +22,9 @@ from kanbanmanager.enums import Priority, ColumnType
 # Columns added to pre-existing tables after the initial schema. create_all() only
 # creates missing *tables*, so these are applied with ALTER TABLE on startup/restore.
 _ADDED_COLUMNS = {
+    "tasks": [
+        ("assignee", "VARCHAR(120)"),
+    ],
     "activity_logs": [
         ("actor", "VARCHAR(120)"),
         ("field_name", "VARCHAR(50)"),
@@ -32,6 +35,19 @@ _ADDED_COLUMNS = {
 _ADDED_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_activity_task_time ON activity_logs (task_id, timestamp)",
 ]
+# Before time entries existed, "spent hours" was a bare number on the task. Turn any such
+# value into a single manual entry so totals stay consistent (idempotent: only tasks
+# that have spent hours but no entries at all).
+_BACKFILL_SPENT_HOURS = """
+INSERT INTO time_entries (task_id, user, started_at, ended_at, duration_seconds, source, note, created_at)
+SELECT t.id, NULL,
+       datetime(t.updated_at, printf('-%d seconds', CAST(ROUND(t.spent_hours * 3600) AS INTEGER))),
+       t.updated_at, CAST(ROUND(t.spent_hours * 3600) AS INTEGER), 'MANUAL',
+       'Time spent recorded before time tracking', CURRENT_TIMESTAMP
+FROM tasks t
+WHERE COALESCE(t.spent_hours, 0) > 0
+  AND NOT EXISTS (SELECT 1 FROM time_entries e WHERE e.task_id = t.id)
+"""
 
 
 @event.listens_for(Engine, "connect")
@@ -95,6 +111,7 @@ class DatabaseManager:
                         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
             for stmt in _ADDED_INDEXES:
                 conn.execute(text(stmt))
+            conn.execute(text(_BACKFILL_SPENT_HOURS))
 
     @contextmanager
     def session_scope(self) -> Generator[Session, None, None]:

@@ -13,6 +13,9 @@ from kanbanmanager.database.models import (
     ActivityLog,
     Comment,
     Attachment,
+    TimeEntry,
+    TeamMember,
+    AppSetting,
 )
 
 __all__ = [
@@ -27,4 +30,7 @@ __all__ = [
     "ActivityLog",
     "Comment",
     "Attachment",
+    "TimeEntry",
+    "TeamMember",
+    "AppSetting",
 ]

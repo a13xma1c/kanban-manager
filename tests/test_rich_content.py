@@ -324,7 +324,7 @@ def test_json_roundtrip_preserves_rich_content(env, tmp_path):
 
     dest = backups.export_to_json(tmp / "export.json")
     exported = json.loads(dest.read_text())
-    assert exported["version"] == "1.1"
+    assert exported["version"] == "1.2"
 
     # Shift ids in the target DB so a stale attachment id in the description would be detectable
     new_mgr = DatabaseManager(tmp_path / "imported" / "k.db")
@@ -380,7 +380,7 @@ def test_import_of_legacy_json_without_rich_content(env, tmp_path):
 # ---------------------------------------------------------------------------
 def _check_demo_board(service, mgr, board_id):
     tasks = service.get_tasks_for_board(board_id)
-    assert len(tasks) == 8
+    assert len(tasks) == 9
     with mgr.session_scope() as session:
         for task in tasks:
             atts = {str(a.id) for a in session.query(Attachment).filter(Attachment.task_id == task.id)}
@@ -425,3 +425,46 @@ def test_demo_board_can_be_added_on_demand(env):
     # the "yours" comment is authored by the current actor so it can be edited
     authors = {c["author"] for t in service.get_tasks_for_board(demo.id) for c in service.get_comments(t.id)}
     assert "Ada" in authors
+
+
+@pytest.mark.parametrize("weekday_offset", range(7))
+def test_demo_time_entries_are_consistent_on_every_weekday(tmp_path, monkeypatch, weekday_offset):
+    """The demo is generated relative to 'now'; it must be realistic whichever day it is built on."""
+    from datetime import timezone
+
+    import kanbanmanager.database.demo_board as demo
+
+    fake_local = datetime(2024, 6, 3, 11, 30) + timedelta(days=weekday_offset)  # Monday + offset
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fake_local if tz is None else fake_local.astimezone(tz)
+
+    fake_utc = fake_local.astimezone(timezone.utc).replace(tzinfo=None)
+    monkeypatch.setattr(demo, "datetime", FrozenDatetime)
+    monkeypatch.setattr(demo, "utc_now", lambda: fake_utc)
+
+    mgr = DatabaseManager(tmp_path / f"demo{weekday_offset}.db")
+    mgr.init_database(seed_defaults=False)
+    service = DatabaseService(mgr)
+    ws = service.create_workspace("W")
+    board = service.create_demo_board(ws.id)
+
+    entries = service.get_time_entries(board_ids=[board.id])
+    assert len(entries) >= 10
+    tasks = {t.id: t for t in service.get_tasks_for_board(board.id)}
+    by_person = {}
+    for e in entries:
+        start, end = datetime.fromisoformat(e["started_at"]), datetime.fromisoformat(e["ended_at"])
+        assert start >= tasks[e["task_id"]].created_at, "time logged before the task existed"
+        assert end <= fake_utc, "time logged in the future"
+        by_person.setdefault(e["user"], []).append((start, end))
+    for person, spans in by_person.items():
+        spans.sort()
+        for (s1, e1), (s2, _e2) in zip(spans, spans[1:]):
+            assert s2 >= e1, f"{person} has overlapping time entries"
+    for t in tasks.values():
+        assert actions(service, t.id)[0] == A.TASK_CREATED.value
+        logged = sum(e["duration_seconds"] for e in entries if e["task_id"] == t.id)
+        assert abs((t.spent_hours or 0) - logged / 3600) < 1e-6

@@ -34,6 +34,8 @@ from PySide6.QtWidgets import (
 from kanbanmanager.enums import Priority
 from kanbanmanager.core.markdown_utils import first_line_snippet
 from kanbanmanager.core.signals import app_signals
+from kanbanmanager.ui.components.activity_panel import avatar_color, initials
+from kanbanmanager.ui.components.flow_layout import FlowLayout
 
 
 MIME_TASK_ID = "application/x-kanban-task-id"
@@ -181,8 +183,8 @@ class TaskCardWidget(QFrame):
         # ---------------------------------------------------------------------
         # Bottom Badges: Due Date, Blocked, Recurring, Hours
         # ---------------------------------------------------------------------
-        bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(6)
+        # Badges wrap onto a second line instead of widening the card past its column
+        bottom_row = FlowLayout(h_spacing=6, v_spacing=4)
 
         # Due Date Badge
         due_iso = self.task_data.get("due_date")
@@ -233,7 +235,6 @@ class TaskCardWidget(QFrame):
             )
             bottom_row.addWidget(rec_badge)
 
-        bottom_row.addStretch()
 
         # Rich-content counters
         for key, icon, tip in (
@@ -247,12 +248,45 @@ class TaskCardWidget(QFrame):
                 counter.setStyleSheet("color: #94A3B8; font-size: 10px;")
                 bottom_row.addWidget(counter)
 
-        # Estimated Hours
-        est_hours = self.task_data.get("estimated_hours", 0.0)
-        if est_hours and est_hours > 0:
-            hrs_lbl = QLabel(f"⏱ {est_hours:.1f}h")
-            hrs_lbl.setStyleSheet("color: #64748B; font-size: 10px;")
+        # Live timer indicator
+        if self.task_data.get("timer_running"):
+            live = QLabel("● Tracking")
+            live.setToolTip("A timer is running on this task")
+            live.setStyleSheet(
+                "color: #F87171; background-color: #450A0A; border: 1px solid #7F1D1D; "
+                "border-radius: 4px; padding: 1px 5px; font-size: 10px; font-weight: bold;"
+            )
+            bottom_row.addWidget(live)
+
+        # Time: logged vs estimate ("⏱ 2.5/5h"), or just the estimate
+        est_hours = float(self.task_data.get("estimated_hours") or 0.0)
+        spent = float(self.task_data.get("spent_hours") or 0.0)
+        if est_hours > 0 or spent > 0:
+            if spent > 0 and est_hours > 0:
+                text = f"⏱ {spent:.1f}/{est_hours:g}h"
+                tip = f"{spent:.2f}h logged of {est_hours:g}h estimated"
+            elif spent > 0:
+                text, tip = f"⏱ {spent:.1f}h", f"{spent:.2f}h logged (no estimate)"
+            else:
+                text, tip = f"⏱ {est_hours:.1f}h", f"{est_hours:g}h estimated"
+            hrs_lbl = QLabel(text)
+            hrs_lbl.setToolTip(tip)
+            over = est_hours > 0 and spent > est_hours
+            hrs_lbl.setStyleSheet(f"color: {'#F87171' if over else '#64748B'}; font-size: 10px;")
             bottom_row.addWidget(hrs_lbl)
+
+        # Assignee avatar
+        assignee = (self.task_data.get("assignee") or "").strip()
+        if assignee:
+            avatar = QLabel(initials(assignee))
+            avatar.setFixedSize(20, 20)
+            avatar.setAlignment(Qt.AlignCenter)
+            avatar.setToolTip(f"Assigned to {assignee}")
+            avatar.setStyleSheet(
+                f"background-color: {avatar_color(assignee)}; color: white; border-radius: 10px; "
+                "font-size: 9px; font-weight: 700;"
+            )
+            bottom_row.addWidget(avatar)
 
         layout.addLayout(bottom_row)
 
@@ -309,6 +343,13 @@ class TaskCardWidget(QFrame):
 
         toggle_act = menu.addAction("✓ Mark Complete" if not self.task_data.get("is_completed") else "○ Mark Incomplete")
         toggle_act.triggered.connect(self._on_toggle_completed)
+
+        menu.addSeparator()
+        if self.task_data.get("timer_running"):
+            menu.addAction("■ Stop Timer", app_signals.timer_stop_requested.emit)
+        else:
+            menu.addAction("▶ Start Stopwatch", lambda: app_signals.timer_start_requested.emit(self.task_id, "stopwatch"))
+            menu.addAction("🍅 Start Pomodoro", lambda: app_signals.timer_start_requested.emit(self.task_id, "pomodoro"))
 
         menu.addSeparator()
 

@@ -24,6 +24,19 @@ MAX_ATTACHMENT_SIZE_MB = 25
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 
 
+# Time tracking & workload
+POMODORO_DEFAULTS = {
+    "focus_minutes": 25,
+    "short_break_minutes": 5,
+    "long_break_minutes": 15,
+    "sessions_before_long_break": 4,
+    "auto_start_breaks": True,
+}
+MIN_TIME_ENTRY_SECONDS = 30        # shorter timer runs are treated as accidental and not logged
+DEFAULT_WEEKLY_CAPACITY_HOURS = 40.0
+DEFAULT_WORKING_DAYS = [0, 1, 2, 3, 4]  # Monday-Friday (0 = Monday)
+
+
 def get_current_user() -> str:
     """Display name used as comment author and audit-trail actor.
 

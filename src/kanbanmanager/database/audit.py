@@ -65,6 +65,7 @@ def snapshot_task(task, column_name: str = "") -> Dict[str, Any]:
         "title": task.title or "",
         "description": task.description or "",
         "priority": task.priority,
+        "assignee": (task.assignee or "").strip(),
         "column_id": task.column_id,
         "column_name": column_name,
         "estimated_hours": round(float(task.estimated_hours or 0.0), 2),
@@ -132,6 +133,16 @@ def diff_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> List[Change]:
                 new["column_name"],
             )
         )
+
+    if old["assignee"] != new["assignee"]:
+        o, n = old["assignee"] or None, new["assignee"] or None
+        if not o:
+            details = f"Assigned to {n}"
+        elif not n:
+            details = f"Unassigned (was {o})"
+        else:
+            details = f"Reassigned from {o} to {n}"
+        changes.append(Change(U, "assignee", details, o, n))
 
     if old["priority"] != new["priority"]:
         o, n = priority_display(old["priority"]), priority_display(new["priority"])

@@ -37,7 +37,7 @@ class FilterBar(QFrame):
     # Narrowest a filter combo may get before its text is clipped (never overlaps)
     COMBO_MIN_WIDTH = 104
     COMBO_CHROME_WIDTH = 52  # padding + drop-down arrow around the text
-    SEARCH_MIN_WIDTH = 200
+    SEARCH_MIN_WIDTH = 160
     SEARCH_MAX_WIDTH = 420
 
     def _init_ui(self) -> None:
@@ -58,7 +58,8 @@ class FilterBar(QFrame):
         # Search Box (takes the free space in the top row, within limits)
         # ---------------------------------------------------------------------
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("🔍 Search tasks by title or description...")
+        self.search_input.setPlaceholderText("🔍 Search tasks...")
+        self.search_input.setToolTip("Search tasks by title or description (Ctrl+F)")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setMinimumWidth(self.SEARCH_MIN_WIDTH)
         self.search_input.setMaximumWidth(self.SEARCH_MAX_WIDTH)
@@ -128,7 +129,7 @@ class FilterBar(QFrame):
         switcher.setStyleSheet(
             "#ViewSwitcher { background-color: #0F172A; border: 1px solid #334155; border-radius: 7px; }"
             "#ViewSwitcher QPushButton { background: transparent; color: #94A3B8; border: none;"
-            " border-radius: 5px; padding: 5px 12px; font-weight: 600; }"
+            " border-radius: 5px; padding: 5px 8px; font-weight: 600; }"
             "#ViewSwitcher QPushButton:hover { background-color: #1E293B; color: #F8FAFC; }"
             "#ViewSwitcher QPushButton:checked { background-color: #3B82F6; color: #FFFFFF; }"
         )
@@ -152,14 +153,28 @@ class FilterBar(QFrame):
         self.btn_calendar = view_button("📅 Calendar", "Month/week calendar of due dates")
         self.btn_timeline = view_button("📈 Timeline", "Timeline / Gantt view with dependencies")
         self.btn_analytics = view_button("📊 Analytics", "Board metrics and activity")
+        self.btn_workload = view_button("👥 Workload", "Team workload, capacity planning and timesheets")
         self.btn_board.setChecked(True)
 
         self.btn_board.clicked.connect(lambda: app_signals.view_mode_changed.emit(ViewMode.BOARD.value))
         self.btn_calendar.clicked.connect(lambda: app_signals.view_mode_changed.emit(ViewMode.CALENDAR.value))
         self.btn_timeline.clicked.connect(lambda: app_signals.view_mode_changed.emit(ViewMode.TIMELINE.value))
         self.btn_analytics.clicked.connect(lambda: app_signals.view_mode_changed.emit(ViewMode.ANALYTICS.value))
+        self.btn_workload.clicked.connect(lambda: app_signals.view_mode_changed.emit(ViewMode.WORKLOAD.value))
 
         top_row.addWidget(switcher)
+
+    def set_view_mode(self, mode: str) -> None:
+        """Reflect the active view in the switcher (also when changed programmatically)."""
+        buttons = {
+            ViewMode.BOARD.value: self.btn_board,
+            ViewMode.CALENDAR.value: self.btn_calendar,
+            ViewMode.TIMELINE.value: self.btn_timeline,
+            ViewMode.ANALYTICS.value: self.btn_analytics,
+            ViewMode.WORKLOAD.value: self.btn_workload,
+        }
+        if mode in buttons:
+            buttons[mode].setChecked(True)
 
     def set_board_labels(self, labels: List[Dict[str, Any]]) -> None:
         """Update available labels in label filter dropdown."""

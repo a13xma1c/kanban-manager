@@ -33,12 +33,14 @@ from PySide6.QtWidgets import (
 )
 
 from kanbanmanager.config import IMAGE_EXTENSIONS
+from kanbanmanager.timefmt import format_duration
 from kanbanmanager.core.markdown_utils import attachment_refs, remove_attachment_refs, rewrite_attachment_refs
 from kanbanmanager.enums import Priority, RecurrenceFrequency, DependencyType
 from kanbanmanager.database.service import DatabaseService
 from kanbanmanager.ui.components.activity_panel import ActivityPanel
 from kanbanmanager.ui.components.attachments_panel import AttachmentsPanel
 from kanbanmanager.ui.components.markdown_editor import MarkdownEditor
+from kanbanmanager.ui.components.time_panel import TimePanel
 
 
 class TaskDialog(QDialog):
@@ -59,8 +61,10 @@ class TaskDialog(QDialog):
         default_column_id: Optional[int] = None,
         service: Optional[DatabaseService] = None,
         parent: Optional[QWidget] = None,
+        tracker=None,
     ):
         super().__init__(parent)
+        self.tracker = tracker  # shared TimeTracker (optional; enables live timers in the Time tab)
         self.board_id = board_id
         self.task_id = task_id
         self.default_column_id = default_column_id
@@ -68,7 +72,7 @@ class TaskDialog(QDialog):
 
         self.setWindowTitle("Edit Task" if self.task_id else "Create New Task")
         self.setMinimumSize(760, 620)
-        self.resize(960, 760)
+        self.resize(1100, 760)  # all eight tabs visible at the default size
 
         self._checklist_items: List[Dict[str, Any]] = []
         # True when something was persisted without Save (e.g. a comment was posted)
@@ -76,7 +80,7 @@ class TaskDialog(QDialog):
 
         self._init_ui()
         self._load_data()
-        self.finished.connect(lambda _r: self.attachments_panel.cleanup())
+        self.finished.connect(self._on_finished)
 
     def _init_ui(self) -> None:
         main_layout = QVBoxLayout(self)
@@ -124,6 +128,14 @@ class TaskDialog(QDialog):
         self.hours_spin.setRange(0.0, 999.0)
         self.hours_spin.setSingleStep(0.5)
         top_grid.addWidget(self.hours_spin, 1, 1)
+
+        top_grid.addWidget(QLabel("Assignee:"), 1, 2)
+        self.assignee_combo = QComboBox()
+        self.assignee_combo.setEditable(True)  # pick a teammate or type a new name
+        self.assignee_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.assignee_combo.lineEdit().setPlaceholderText("Unassigned")
+        self.assignee_combo.setToolTip("Who is responsible. Used by the Workload view for capacity planning.")
+        top_grid.addWidget(self.assignee_combo, 1, 3)
 
         gen_layout.addLayout(top_grid)
 
@@ -298,6 +310,11 @@ class TaskDialog(QDialog):
         # ---------------------------------------------------------------------
         # Tab 7: Activity - comments + audit trail
         # ---------------------------------------------------------------------
+        self.time_panel = TimePanel(self.service, self.task_id, tracker=self.tracker)
+        self._time_tab = self.tabs.addTab(self.time_panel, "Time")
+        self.time_panel.time_changed.connect(self._on_time_changed)
+        self.hours_spin.valueChanged.connect(self.time_panel.set_estimate)
+
         self.activity_panel = ActivityPanel(self.service, self.task_id)
         self._activity_tab = self.tabs.addTab(self.activity_panel, "Activity")
         self.activity_panel.comments_changed.connect(self._on_comments_changed)
@@ -341,6 +358,13 @@ class TaskDialog(QDialog):
             if idx >= 0:
                 self.column_combo.setCurrentIndex(idx)
 
+        # Assignees: team members, people already assigned, and you
+        self.assignee_combo.clear()
+        self.assignee_combo.addItem("")
+        for name in self.service.get_people():
+            self.assignee_combo.addItem(name)
+        self.assignee_combo.setCurrentIndex(0)
+
         # Load board labels
         labels = self.service.get_labels_for_board(self.board_id)
         self.labels_list.clear()
@@ -383,6 +407,7 @@ class TaskDialog(QDialog):
             self.priority_combo.setCurrentIndex(pri_idx)
 
         self.hours_spin.setValue(task.estimated_hours or 0.0)
+        self.assignee_combo.setCurrentText(task.assignee or "")
 
         # Dates
         if task.start_date:
@@ -452,6 +477,7 @@ class TaskDialog(QDialog):
         column_id = self.column_combo.currentData()
         priority = self.priority_combo.currentData()
         estimated_hours = self.hours_spin.value()
+        assignee = self.assignee_combo.currentText().strip() or None
         desc = self.desc_editor.markdown()
 
         start_date_val = self.start_date_edit.date().toPython() if self.has_start_chk.isChecked() else None
@@ -487,6 +513,7 @@ class TaskDialog(QDialog):
             self.service.update_task(
                 task_id=self.task_id,
                 title=title,
+                assignee=assignee,
                 description=desc,
                 column_id=column_id,
                 priority=priority,
@@ -505,6 +532,7 @@ class TaskDialog(QDialog):
                 board_id=self.board_id,
                 column_id=column_id,
                 title=title,
+                assignee=assignee,
                 description=desc,
                 priority=priority,
                 estimated_hours=estimated_hours,
@@ -560,11 +588,21 @@ class TaskDialog(QDialog):
     def _update_tab_titles(self) -> None:
         n_att = self.attachments_panel.count()
         self.tabs.setTabText(self._attachments_tab, f"Attachments ({n_att})" if n_att else "Attachments")
+        logged = self.time_panel.logged_seconds()
+        self.tabs.setTabText(self._time_tab, f"Time ({format_duration(logged)})" if logged else "Time")
         n_com = self.activity_panel.comment_count()
         self.tabs.setTabText(self._activity_tab, f"Activity ({n_com})" if n_com else "Activity")
         self.tabs.setTabToolTip(
             self._activity_tab, f"Comments ({n_com}) and the full change history of this task"
         )
+
+    def _on_time_changed(self) -> None:
+        self.external_changes = True
+        self._update_tab_titles()
+
+    def _on_finished(self, _result: int) -> None:
+        self.attachments_panel.cleanup()
+        self.time_panel.detach()
 
     def _on_comments_changed(self) -> None:
         self.external_changes = True

@@ -10,7 +10,7 @@ import os
 import shutil
 import sqlite3
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -29,10 +29,14 @@ from kanbanmanager.database.models import (
     ActivityLog,
     Comment,
     Attachment,
+    TimeEntry,
+    TeamMember,
+    utc_now,
 )
 from kanbanmanager.database.service import DatabaseService
 
-EXPORT_FORMAT_VERSION = "1.1"  # 1.1 adds comments, attachments and per-task history
+# 1.1 adds comments, attachments and per-task history; 1.2 adds assignees, time entries, team capacity
+EXPORT_FORMAT_VERSION = "1.2"
 ATTACHMENT_MIRROR_DIRNAME = "attachments"
 
 
@@ -179,6 +183,9 @@ class BackupManager:
         }
 
         with self.db.session_scope() as session:
+            data["team_members"] = [m.to_dict() for m in session.query(TeamMember).order_by(TeamMember.name)]
+            for m in data["team_members"]:
+                m.pop("id", None)
             ws_query = session.query(Workspace)
             if workspace_id:
                 ws_query = ws_query.filter(Workspace.id == workspace_id)
@@ -246,6 +253,19 @@ class BackupManager:
                                 "is_recurring": task.is_recurring,
                                 "recurrence_rule": task.recurrence_rule,
                                 "labels": [lbl.name for lbl in task.labels],
+                                "assignee": task.assignee,
+                                "time_entries": [
+                                    {
+                                        "user": e.user,
+                                        "started_at": e.started_at.isoformat() if e.started_at else None,
+                                        "ended_at": e.ended_at.isoformat() if e.ended_at else None,
+                                        "duration_seconds": e.duration_seconds,
+                                        "source": e.source,
+                                        "note": e.note,
+                                    }
+                                    for e in task.time_entries
+                                    if e.ended_at is not None  # running timers are not portable
+                                ],
                                 "comments": [
                                     {
                                         "author": c.author,
@@ -326,6 +346,16 @@ class BackupManager:
 
         service = DatabaseService(self.db)
 
+        for m_data in data.get("team_members", []) or []:
+            if m_data.get("name"):
+                existing = {m["name"] for m in service.get_team_members()}
+                if m_data["name"] not in existing:  # never overwrite capacity configured locally
+                    service.upsert_team_member(
+                        m_data["name"],
+                        float(m_data.get("weekly_capacity_hours", 40.0)),
+                        list(m_data.get("working_days") or [0, 1, 2, 3, 4]),
+                    )
+
         for ws_data in data.get("workspaces", []):
             if target_workspace_id:
                 ws = service.get_workspace(target_workspace_id)
@@ -404,6 +434,7 @@ class BackupManager:
                             custom_fields=t_data.get("custom_fields", {}),
                             is_recurring=bool(t_data.get("is_recurring", False)),
                             recurrence_rule=t_data.get("recurrence_rule", {}),
+                            assignee=t_data.get("assignee"),
                         )
 
                         if t_data.get("is_completed"):
@@ -463,8 +494,38 @@ class BackupManager:
                     ref_map[str(a_data["temp_id"])] = str(att.id)
 
         with self.db.session_scope() as session:
+            entries = t_data.get("time_entries")
+            for e_data in entries or []:
+                start = _parse_dt(e_data.get("started_at"))
+                seconds = int(e_data.get("duration_seconds") or 0)
+                if start is None or seconds <= 0:
+                    continue
+                session.add(
+                    TimeEntry(
+                        task_id=task_id,
+                        user=e_data.get("user"),
+                        started_at=start,
+                        ended_at=_parse_dt(e_data.get("ended_at")) or start + timedelta(seconds=seconds),
+                        duration_seconds=seconds,
+                        source=e_data.get("source") or "MANUAL",
+                        note=e_data.get("note"),
+                    )
+                )
+            task = session.get(Task, task_id)
+            if entries is not None and task is not None:
+                session.flush()
+                service._recompute_spent_hours(session, task_id)
+            elif task is not None and t_data.get("spent_hours"):
+                # Older exports only carried a number; keep it as one manual entry
+                seconds = int(round(float(t_data["spent_hours"]) * 3600))
+                if seconds > 0:
+                    now = utc_now()
+                    session.add(TimeEntry(task_id=task_id, user=None, started_at=now - timedelta(seconds=seconds),
+                                          ended_at=now, duration_seconds=seconds, source="MANUAL",
+                                          note="Time spent recorded before time tracking"))
+                    session.flush()
+                    service._recompute_spent_hours(session, task_id)
             if ref_map:
-                task = session.get(Task, task_id)
                 if task and task.description:
                     task.description = rewrite_attachment_refs(task.description, ref_map)
             for c_data in t_data.get("comments", []) or []:

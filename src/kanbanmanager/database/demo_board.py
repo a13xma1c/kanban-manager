@@ -15,7 +15,7 @@ timestamps rather than through DatabaseService (which always stamps "now").
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -32,9 +32,12 @@ from kanbanmanager.database.models import (
     Label,
     Task,
     TaskDependency,
+    TeamMember,
+    TimeEntry,
     utc_now,
 )
-from kanbanmanager.enums import ActivityAction as A, Priority, RecurrenceFrequency
+from kanbanmanager.enums import ActivityAction as A, Priority, RecurrenceFrequency, TimeEntrySource
+from kanbanmanager.timefmt import format_duration
 
 DEMO_BOARD_NAME = "Feature Tour"
 DEMO_BOARD_DESCRIPTION = (
@@ -48,6 +51,13 @@ ELENA = "Elena Rossi"
 
 BACKLOG, TODO, IN_PROGRESS, IN_REVIEW, DONE = range(5)
 
+# Weekly capacity and working days (0 = Monday) for the workload view
+DEMO_TEAM = {
+    PRIYA: (32.0, [0, 1, 2, 3]),
+    MARCUS: (40.0, [0, 1, 2, 3, 4]),
+    ELENA: (16.0, [0, 1]),  # part-time
+}
+
 
 class _DemoBuilder:
     def __init__(self, session: Session, store: AttachmentStore, you: str):
@@ -59,6 +69,7 @@ class _DemoBuilder:
         self.cols: List[BoardColumn] = []
         self.labels: Dict[str, Label] = {}
         self._positions: Dict[int, int] = {}
+        self._booked: Dict[str, List[tuple]] = {}  # person -> [(start, end)] of logged work (UTC)
 
     # ------------------------------------------------------------------
     def ago(self, days: float = 0, hours: float = 0) -> datetime:
@@ -134,6 +145,53 @@ class _DemoBuilder:
         flat = " ".join(body.split())
         self.log(task, A.COMMENT_ADDED, author, when, f"Commented: {flat[:79] + '…' if len(flat) > 80 else flat}",
                  "comment", None, body)
+
+    def track(self, task: Task, user: str, days_ago: int, local_hour: float, minutes: int,
+              source: TimeEntrySource = TimeEntrySource.STOPWATCH, note: str = "") -> None:
+        """Log work in a (local) working-hours slot ``days_ago`` *working* days back."""
+        day = datetime.now().date()
+        remaining = days_ago
+        while remaining > 0 or day.weekday() >= 5:
+            day -= timedelta(days=1)
+            if day.weekday() < 5:
+                remaining -= 1
+        slot = time(int(local_hour), int((local_hour % 1) * 60))
+
+        def to_utc(d):  # stored as naive UTC
+            return datetime.combine(d, slot).astimezone(timezone.utc).replace(tzinfo=None)
+
+        start = to_utc(day)
+        while start < task.created_at:  # work can't predate the task; move to the next working day
+            day += timedelta(days=1)
+            while day.weekday() >= 5:
+                day += timedelta(days=1)
+            start = to_utc(day)
+        seconds = minutes * 60
+        # Nobody works on two things at once: move to the first free slot after any overlap
+        booked = self._booked.setdefault(user, [])
+        moved = True
+        while moved:
+            moved = False
+            for b_start, b_end in booked:
+                if start < b_end and b_start < start + timedelta(seconds=seconds):
+                    start = b_end + timedelta(minutes=10)
+                    moved = True
+        if start + timedelta(seconds=seconds) >= self.now:  # never in the future
+            start = min(b for b, _ in booked) - timedelta(seconds=seconds + 600) if booked else \
+                self.now - timedelta(seconds=seconds + 300)
+        booked.append((start, start + timedelta(seconds=seconds)))
+        self.s.add(TimeEntry(task_id=task.id, user=user, started_at=start, ended_at=start + timedelta(seconds=seconds),
+                             duration_seconds=seconds, source=source.value, note=note or None,
+                             planned_seconds=seconds if source == TimeEntrySource.POMODORO else None))
+        self.log(task, A.TIME_LOGGED, user, start + timedelta(seconds=seconds),
+                 f"Logged {format_duration(seconds)} ({source.display_name.lower()})", "time", None, str(seconds))
+
+    def finish_time(self) -> None:
+        """Set each task's spent hours from its time entries."""
+        self.s.flush()
+        for task in self.s.query(Task).filter(Task.board_id == self.board.id):
+            total = sum(e.duration_seconds for e in self.s.query(TimeEntry).filter(TimeEntry.task_id == task.id))
+            task.spent_hours = total / 3600.0
 
     def attach(self, task: Task, filename: str, data: bytes, author: str, when: datetime, log: bool = True) -> Attachment:
         blob = self.store.store_bytes(data, filename)
@@ -228,10 +286,15 @@ def build_demo_board(
 
     b = _DemoBuilder(session, store, you)
     b.create_board(workspace_id, position)
+    for name, (capacity, days) in DEMO_TEAM.items():  # keep any capacity the user already set
+        if session.query(TeamMember).filter(TeamMember.name == name).first() is None:
+            member = TeamMember(name=name, weekly_capacity_hours=capacity)
+            member.working_days = days
+            session.add(member)
 
     # -- 1. Welcome --------------------------------------------------------
     welcome = b.task(TODO, "👋 Start here: take the feature tour", b.ago(days=7), PRIYA,
-                     priority=Priority.HIGH.value, labels=["Documentation"], estimated_hours=0.5)
+                     priority=Priority.HIGH.value, labels=["Documentation"], estimated_hours=0.5, assignee=PRIYA)
     banner = b.attach(welcome, "welcome_banner.png", demo_images.welcome_banner(), PRIYA, b.ago(days=7), log=True)
     welcome.description = f"""![Feature tour banner](attachment:{banner.id})
 
@@ -271,7 +334,7 @@ New to Markdown? The [CommonMark tutorial](https://commonmark.org/help/) takes t
 
     # -- 2. Onboarding flow (richest history) ------------------------------
     onboarding = b.task(IN_REVIEW, "Design the new onboarding flow", b.ago(days=12), PRIYA, created_in=BACKLOG,
-                        priority=Priority.HIGH.value, estimated_hours=12.0)
+                        priority=Priority.HIGH.value, estimated_hours=12.0, assignee=ELENA)
     onboarding.labels = [b.labels["Design"], b.labels["Feature"]]
     onboarding.due_date = (b.now + timedelta(days=3)).replace(hour=17, minute=0, second=0, microsecond=0)
     onboarding.start_date = b.ago(days=11).date()
@@ -341,7 +404,7 @@ Colours follow the existing design tokens - no new palette needed:
 
     # -- 3. Crash bug (in progress, urgent, blocks the CDN migration) ------
     crash = b.task(IN_PROGRESS, "Crash when importing large CSV files", b.ago(days=4), PRIYA, created_in=TODO,
-                   priority=Priority.URGENT.value, labels=["Bug"], estimated_hours=5.0)
+                   priority=Priority.URGENT.value, labels=["Bug"], estimated_hours=5.0, assignee=MARCUS)
     crash.due_date = (b.now + timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
     shot = b.attach(crash, "crash_dialog.png", demo_images.crash_dialog(), PRIYA, b.ago(days=4) + timedelta(minutes=3))
     b.attach(crash, "crash_log.txt", _CRASH_LOG.encode(), PRIYA, b.ago(days=4) + timedelta(minutes=3))
@@ -395,8 +458,8 @@ MemoryError
 
     # -- 4. Q3 report (done) -----------------------------------------------
     report = b.task(DONE, "Publish the Q3 performance report", b.ago(days=16), PRIYA, created_in=TODO,
-                    priority=Priority.MEDIUM.value, labels=["Documentation"], estimated_hours=4.0, spent_hours=3.5,
-                    completed_at=b.ago(days=2))
+                    priority=Priority.MEDIUM.value, labels=["Documentation"], estimated_hours=4.0,
+                    completed_at=b.ago(days=2), assignee=PRIYA)
     chart = b.attach(report, "q3_tasks_completed.png", demo_images.performance_chart(), PRIYA, b.ago(days=5))
     b.attach(report, "q3_metrics.csv", _Q3_CSV, PRIYA, b.ago(days=5))
     report.description = f"""## Highlights
@@ -426,6 +489,8 @@ The raw numbers are in `q3_metrics.csv`.
     # -- 5. Webhook docs ---------------------------------------------------
     docs = b.task(TODO, "Write API docs for webhooks", b.ago(days=5), MARCUS,
                   priority=Priority.MEDIUM.value, labels=["Documentation", "Feature"], estimated_hours=6.0,
+                  assignee=MARCUS, start_date=b.now.date(),
+                  due_date=(b.now + timedelta(days=4)).replace(hour=17, minute=0, second=0, microsecond=0),
                   checklist=[
                       {"id": 1, "text": "Event catalogue", "done": True},
                       {"id": 2, "text": "Payload reference", "done": False},
@@ -462,7 +527,9 @@ The raw numbers are in `q3_metrics.csv`.
 
     # -- 6. CDN migration (blocked by the crash fix) ------------------------
     cdn = b.task(BACKLOG, "Migrate attachment storage to the CDN", b.ago(days=3), MARCUS,
-                 priority=Priority.MEDIUM.value, labels=["Refactor", "Improvement"], estimated_hours=16.0)
+                 priority=Priority.MEDIUM.value, labels=["Refactor", "Improvement"], estimated_hours=16.0,
+                 assignee=MARCUS, start_date=(b.now + timedelta(days=2)).date(),
+                 due_date=(b.now + timedelta(days=11)).replace(hour=17, minute=0, second=0, microsecond=0))
     cdn.description = """> Large uploads should never block the UI thread.
 > - *Storage RFC, section 2*
 
@@ -479,7 +546,7 @@ Blocked by the CSV import crash: both changes touch the same file-streaming code
     sync_due = (b.now + timedelta(days=(4 - b.now.weekday()) % 7 or 7)).replace(hour=10, minute=0, second=0,
                                                                                   microsecond=0)
     sync = b.task(BACKLOG, "Weekly team sync", b.ago(days=20), PRIYA, priority=Priority.LOW.value,
-                  is_recurring=True, due_date=sync_due,
+                  is_recurring=True, due_date=sync_due, estimated_hours=1.0, assignee=PRIYA,
                   recurrence_rule_json=json.dumps({"frequency": RecurrenceFrequency.WEEKLY.value, "interval": 1}))
     b.attach(sync, "meeting_notes_template.md", _MEETING_TEMPLATE, PRIYA, b.ago(days=20))
     sync.description = """Every Friday at 10:00. Copy the attached template into a comment after each meeting.
@@ -508,6 +575,36 @@ Blocked by the CSV import crash: both changes touch the same file-streaming code
 """
     b.log(play, A.TASK_UPDATED, you, b.ago(hours=1) + timedelta(minutes=1), "Added a description", "description",
           "", play.description)
+
+    # -- 9. Capacity crunch (makes the workload view interesting) -----------
+    launch = b.task(TODO, "Prepare launch screenshots & store listing", b.ago(days=2), PRIYA,
+                    priority=Priority.HIGH.value, labels=["Design"], estimated_hours=14.0, assignee=ELENA,
+                    start_date=b.now.date(),
+                    due_date=(b.now + timedelta(days=3)).replace(hour=17, minute=0, second=0, microsecond=0))
+    launch.description = """Screenshots for every supported platform plus the store copy.
+
+> Elena is part-time (Mon/Tue). Open the **Workload** view to see why this
+> deadline is a problem, then reassign or move the date.
+"""
+    b.log(launch, A.TASK_UPDATED, PRIYA, b.ago(days=2) + timedelta(minutes=1), "Assigned to Elena Rossi",
+          "assignee", None, ELENA)
+
+    # -- Logged time (past two weeks, local working hours) -----------------
+    P, S = TimeEntrySource.POMODORO, TimeEntrySource.STOPWATCH
+    b.track(onboarding, ELENA, 10, 9.5, 120, S, "User research synthesis")
+    b.track(onboarding, ELENA, 9, 10, 150, S, "Low-fi wireframes")
+    b.track(onboarding, ELENA, 7, 13, 100, P, "Wireframes v2 (4 pomodoros)")
+    b.track(onboarding, ELENA, 3, 9, 175, S, "Hi-fi mockups")
+    b.track(crash, MARCUS, 3, 14, 50, P, "Reproduce with sample file")
+    b.track(crash, MARCUS, 2, 10, 100, S, "Streaming reader prototype")
+    b.track(report, PRIYA, 6, 9, 90, S, "Pull numbers")
+    b.track(report, PRIYA, 5, 11, 75, P, "Write highlights")
+    b.track(report, PRIYA, 3, 15, 45, S, "Review fixes")
+    b.track(docs, MARCUS, 4, 15, 50, P, "Event catalogue")
+    b.track(docs, MARCUS, 1, 16, 40, S)
+    b.track(sync, PRIYA, 7, 10, 30, S, "Weekly sync")
+    b.track(welcome, PRIYA, 7, 8.5, 30, P, "Write the tour")
+    b.finish_time()
 
     session.flush()
     return b.board

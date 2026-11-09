@@ -97,6 +97,21 @@ class ViewMode(str, Enum):
     CALENDAR = "CALENDAR"
     TIMELINE = "TIMELINE"
     ANALYTICS = "ANALYTICS"
+    WORKLOAD = "WORKLOAD"
+
+
+class TimeEntrySource(str, Enum):
+    STOPWATCH = "STOPWATCH"
+    POMODORO = "POMODORO"
+    MANUAL = "MANUAL"
+
+    @property
+    def display_name(self) -> str:
+        return {
+            TimeEntrySource.STOPWATCH: "Stopwatch",
+            TimeEntrySource.POMODORO: "Pomodoro",
+            TimeEntrySource.MANUAL: "Manual",
+        }[self]
 
 
 class ActivityAction(str, Enum):
@@ -115,6 +130,9 @@ class ActivityAction(str, Enum):
     DEPENDENCY_ADDED = "DEPENDENCY_ADDED"
     DEPENDENCY_REMOVED = "DEPENDENCY_REMOVED"
     REMINDER_SET = "REMINDER_SET"
+    TIME_LOGGED = "TIME_LOGGED"
+    TIME_ENTRY_UPDATED = "TIME_ENTRY_UPDATED"
+    TIME_ENTRY_DELETED = "TIME_ENTRY_DELETED"
 
     @property
     def is_comment_action(self) -> bool:

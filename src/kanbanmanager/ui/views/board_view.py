@@ -38,6 +38,7 @@ class BoardView(QWidget):
         self.current_board_id: Optional[int] = None
         self.current_filters: Dict[str, Any] = {}
         self.column_widgets: Dict[int, KanbanColumnWidget] = {}
+        self.running_task_id: Optional[int] = None  # task with a live timer (badge on its card)
 
         self._init_ui()
 
@@ -107,7 +108,9 @@ class BoardView(QWidget):
         tasks_by_col: Dict[int, List[Dict[str, Any]]] = {c.id: [] for c in board.columns}
         for t in tasks:
             if t.column_id in tasks_by_col:
-                tasks_by_col[t.column_id].append(t.to_dict())
+                data = t.to_dict()
+                data["timer_running"] = t.id == self.running_task_id
+                tasks_by_col[t.column_id].append(data)
 
         # Clear existing column widgets
         while self.columns_layout.count() > 0:

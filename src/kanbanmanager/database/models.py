@@ -235,6 +235,9 @@ class Task(Base):
     recurrence_rule_json = SAColumn(Text, default="{}", nullable=False)
     parent_recurring_task_id = SAColumn(Integer, nullable=True)
 
+    # Person responsible (free-form display name; capacity lives in TeamMember)
+    assignee = SAColumn(String(120), nullable=True)
+
     created_at = SAColumn(DateTime, default=utc_now, nullable=False)
     updated_at = SAColumn(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
@@ -254,6 +257,12 @@ class Task(Base):
         back_populates="task",
         cascade="all, delete-orphan",
         order_by="Attachment.created_at",
+    )
+    time_entries = relationship(
+        "TimeEntry",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="TimeEntry.started_at",
     )
 
     # Dependencies: tasks that this task depends on (this task is blocked by)
@@ -346,6 +355,7 @@ class Task(Base):
             "labels": [lbl.to_dict() for lbl in self.labels],
             "is_overdue": self.is_overdue,
             "is_blocked": self.is_blocked,
+            "assignee": self.assignee or "",
             "comment_count": self._loaded_int("comment_count"),
             "attachment_count": self._loaded_int("attachment_count"),
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -516,6 +526,87 @@ class Attachment(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "is_image": self.is_image,
         }
+
+
+class TimeEntry(Base):
+    """A span of time worked on a task. ``ended_at`` is NULL while a timer is running.
+
+    Timestamps are naive UTC, like the rest of the audit data.
+    """
+
+    __tablename__ = "time_entries"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    task_id = SAColumn(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    user = SAColumn(String(120), nullable=True)
+    started_at = SAColumn(DateTime, nullable=False, index=True)
+    ended_at = SAColumn(DateTime, nullable=True)
+    duration_seconds = SAColumn(Integer, nullable=False, default=0)
+    source = SAColumn(String(20), nullable=False, default="STOPWATCH")
+    planned_seconds = SAColumn(Integer, nullable=True)  # Pomodoro focus length, for crash recovery
+    note = SAColumn(Text, nullable=True)
+    created_at = SAColumn(DateTime, default=utc_now, nullable=False)
+
+    task = relationship("Task", back_populates="time_entries")
+
+    @property
+    def is_running(self) -> bool:
+        return self.ended_at is None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "user": self.user or "",
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "ended_at": self.ended_at.isoformat() if self.ended_at else None,
+            "duration_seconds": int(self.duration_seconds or 0),
+            "source": self.source,
+            "planned_seconds": self.planned_seconds,
+            "note": self.note or "",
+            "is_running": self.is_running,
+        }
+
+
+class TeamMember(Base):
+    """A person whose capacity is planned in the workload view."""
+
+    __tablename__ = "team_members"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    name = SAColumn(String(120), nullable=False, unique=True)
+    weekly_capacity_hours = SAColumn(Float, nullable=False, default=40.0)
+    working_days_json = SAColumn(Text, nullable=False, default="[0, 1, 2, 3, 4]")
+    created_at = SAColumn(DateTime, default=utc_now, nullable=False)
+
+    @property
+    def working_days(self) -> List[int]:
+        try:
+            days = json.loads(self.working_days_json or "[]")
+            return sorted({int(d) for d in days if 0 <= int(d) <= 6})
+        except Exception:
+            return [0, 1, 2, 3, 4]
+
+    @working_days.setter
+    def working_days(self, val: List[int]) -> None:
+        self.working_days_json = json.dumps(sorted(set(val or [])))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "weekly_capacity_hours": float(self.weekly_capacity_hours or 0.0),
+            "working_days": self.working_days,
+        }
+
+
+class AppSetting(Base):
+    """Small key/value store for preferences (kept in the DB so they travel with backups)."""
+
+    __tablename__ = "app_settings"
+
+    key = SAColumn(String(80), primary_key=True)
+    value = SAColumn(Text, nullable=False, default="")
 
 
 # Aggregate counts used by task cards; loaded with the Task row via correlated subqueries

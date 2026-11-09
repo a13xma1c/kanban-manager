@@ -34,6 +34,10 @@ class AppSignals(QObject):
     task_completed_toggled = Signal(int, bool)  # task_id, is_completed
     task_edit_requested = Signal(int) # task_id
 
+    # Time tracking
+    timer_start_requested = Signal(int, str)  # task_id, "stopwatch" | "pomodoro"
+    timer_stop_requested = Signal()
+
     # Label & Filter Signals
     labels_changed = Signal(int)      # board_id
     filter_changed = Signal(dict)     # filter criteria dict
