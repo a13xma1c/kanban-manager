@@ -1,0 +1,513 @@
+"""
+Demo Board: a guided tour of rich content, attachments, comments and history
+
+``build_demo_board`` creates a "Feature Tour" board whose cards showcase:
+  * Markdown descriptions (headings, lists, task lists, tables, code, quotes,
+    links) with inline images referencing attachments (``attachment:<id>``)
+  * image and file attachments
+  * comment threads from several teammates (plus one by *you*, so editing and
+    deleting your own comments can be tried)
+  * a realistic, back-dated audit trail consistent with each card's state
+
+The story is scripted, so rows are written directly with explicit actors and
+timestamps rather than through DatabaseService (which always stamps "now").
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+from sqlalchemy.orm import Session
+
+from kanbanmanager.config import DEFAULT_COLUMNS, DEFAULT_LABEL_PALETTE, get_current_user
+from kanbanmanager.database import demo_images
+from kanbanmanager.database.attachments import AttachmentStore, guess_content_type
+from kanbanmanager.database.models import (
+    ActivityLog,
+    Attachment,
+    Board,
+    BoardColumn,
+    Comment,
+    Label,
+    Task,
+    TaskDependency,
+    utc_now,
+)
+from kanbanmanager.enums import ActivityAction as A, Priority, RecurrenceFrequency
+
+DEMO_BOARD_NAME = "Feature Tour"
+DEMO_BOARD_DESCRIPTION = (
+    "Demo board: Markdown descriptions, file & image attachments, comments and a full audit trail. "
+    "Open any card to explore."
+)
+
+PRIYA = "Priya Sharma"
+MARCUS = "Marcus Chen"
+ELENA = "Elena Rossi"
+
+BACKLOG, TODO, IN_PROGRESS, IN_REVIEW, DONE = range(5)
+
+
+class _DemoBuilder:
+    def __init__(self, session: Session, store: AttachmentStore, you: str):
+        self.s = session
+        self.store = store
+        self.you = you
+        self.now = utc_now()
+        self.board: Optional[Board] = None
+        self.cols: List[BoardColumn] = []
+        self.labels: Dict[str, Label] = {}
+        self._positions: Dict[int, int] = {}
+
+    # ------------------------------------------------------------------
+    def ago(self, days: float = 0, hours: float = 0) -> datetime:
+        return self.now - timedelta(days=days, hours=hours)
+
+    def create_board(self, workspace_id: int, position: int) -> Board:
+        self.board = Board(
+            workspace_id=workspace_id,
+            name=DEMO_BOARD_NAME,
+            description=DEMO_BOARD_DESCRIPTION,
+            color="#8B5CF6",
+            icon="sparkles",
+            position=position,
+        )
+        self.s.add(self.board)
+        self.s.flush()
+        for i, c in enumerate(DEFAULT_COLUMNS):
+            col = BoardColumn(
+                board_id=self.board.id,
+                name=c["name"],
+                position=i,
+                wip_limit=c.get("wip_limit", 0),
+                color=c.get("color", "#64748B"),
+                column_type=c.get("type", "CUSTOM"),
+                is_done_column=c.get("is_done_column", False),
+            )
+            self.s.add(col)
+            self.cols.append(col)
+        for name, color in DEFAULT_LABEL_PALETTE:
+            lbl = Label(board_id=self.board.id, name=name, color=color)
+            self.s.add(lbl)
+            self.labels[name] = lbl
+        self.s.flush()
+        return self.board
+
+    def task(self, col: int, title: str, created: datetime, creator: str, created_in: Optional[int] = None,
+             **fields) -> Task:
+        """Create a task in its *current* column; the history records it as created in ``created_in``."""
+        column = self.cols[col]
+        origin = self.cols[created_in if created_in is not None else col]
+        pos = self._positions.get(col, 0)
+        self._positions[col] = pos + 1
+        labels = [self.labels[n] for n in fields.pop("labels", [])]
+        is_done = column.is_done_column
+        t = Task(
+            board_id=self.board.id,
+            column_id=column.id,
+            title=title,
+            position=pos,
+            is_completed=is_done,
+            labels=labels,
+            created_at=created,
+            updated_at=created,
+            **fields,
+        )
+        self.s.add(t)
+        self.s.flush()
+        self.log(t, A.TASK_CREATED, creator, created, f"Created task '{title}' in column '{origin.name}'",
+                 "column", None, origin.name)
+        return t
+
+    def log(self, task: Task, action: A, actor: str, when: datetime, details: str,
+            field: Optional[str] = None, old: Optional[str] = None, new: Optional[str] = None) -> None:
+        self.s.add(ActivityLog(board_id=self.board.id, task_id=task.id, action_type=action.value, details=details,
+                               actor=actor, timestamp=when, field_name=field, old_value=old, new_value=new))
+
+    def move(self, task: Task, actor: str, when: datetime, src: int, dst: int) -> None:
+        a, b = self.cols[src].name, self.cols[dst].name
+        self.log(task, A.TASK_MOVED, actor, when, f"Moved '{task.title}' from '{a}' to '{b}'", "column", a, b)
+
+    def comment(self, task: Task, author: str, when: datetime, body: str, edited: Optional[datetime] = None) -> None:
+        self.s.add(Comment(task_id=task.id, author=author, body=body, created_at=when, updated_at=edited))
+        flat = " ".join(body.split())
+        self.log(task, A.COMMENT_ADDED, author, when, f"Commented: {flat[:79] + '…' if len(flat) > 80 else flat}",
+                 "comment", None, body)
+
+    def attach(self, task: Task, filename: str, data: bytes, author: str, when: datetime, log: bool = True) -> Attachment:
+        blob = self.store.store_bytes(data, filename)
+        att = Attachment(task_id=task.id, filename=filename, stored_name=blob.stored_name,
+                         content_type=guess_content_type(filename), size_bytes=blob.size_bytes,
+                         checksum=blob.checksum, uploaded_by=author, created_at=when)
+        self.s.add(att)
+        self.s.flush()
+        if log:
+            self.log(task, A.ATTACHMENT_ADDED, author, when, f"Attached '{filename}'", "attachment", None, filename)
+        return att
+
+
+# ---------------------------------------------------------------------------
+# Sample file contents
+# ---------------------------------------------------------------------------
+_CRASH_LOG = """2024-09-12 10:41:07,113 INFO  importer: Starting CSV import (sample_import.csv, 61,204 rows)
+2024-09-12 10:41:07,118 DEBUG importer: Detected delimiter ',' and header row
+2024-09-12 10:41:15,902 WARN  ui: Event loop blocked for 8784 ms
+2024-09-12 10:41:19,447 ERROR importer: Import failed
+Traceback (most recent call last):
+  File "importer.py", line 88, in import_rows
+    rows = list(reader)
+MemoryError
+2024-09-12 10:41:19,451 CRITICAL app: Unhandled exception, shutting down
+"""
+
+
+def _sample_csv(rows: int = 400) -> bytes:
+    lines = ["id,title,priority,column,estimate_hours"]
+    pri = ["LOW", "MEDIUM", "HIGH", "URGENT"]
+    cols = ["Backlog", "To Do", "In Progress", "Done"]
+    for i in range(1, rows + 1):
+        lines.append(f"{i},Imported task {i},{pri[i % 4]},{cols[i % 4]},{(i % 8) + 0.5}")
+    return ("\n".join(lines) + "\n").encode()
+
+
+_Q3_CSV = b"""metric,q2,q3,change
+tasks_completed,1240,1530,+23%
+avg_cycle_time_days,4.2,3.1,-26%
+overdue_rate,9%,6%,-3pts
+weekly_active_boards,812,958,+18%
+"""
+
+_WEBHOOK_JSON = json.dumps(
+    {
+        "event": "task.moved",
+        "delivered_at": "2024-09-14T09:30:00Z",
+        "board": {"id": 42, "name": "Product Roadmap"},
+        "task": {"id": 1337, "title": "Ship webhooks", "from_column": "In Review", "to_column": "Done"},
+        "actor": {"name": "Marcus Chen"},
+    },
+    indent=2,
+).encode()
+
+_RESEARCH_NOTES = b"""# Onboarding research notes
+
+Interviewed 8 new users (4 teams, 4 individuals).
+
+* 6/8 were unsure what to do after signing up
+* 5/8 wanted a template instead of an empty board
+* Most abandoned sessions happened on the empty-board screen
+"""
+
+_MEETING_TEMPLATE = b"""# Team sync - {date}
+
+## Wins
+-
+
+## Blockers
+-
+
+## Action items
+- [ ] owner - task
+"""
+
+
+# ---------------------------------------------------------------------------
+# Story
+# ---------------------------------------------------------------------------
+def build_demo_board(
+    session: Session,
+    workspace_id: int,
+    store: AttachmentStore,
+    you: Optional[str] = None,
+    position: Optional[int] = None,
+) -> Board:
+    """Create the demo board in ``workspace_id`` and return it (session is flushed, not committed)."""
+    you = you or get_current_user()
+    if position is None:
+        position = session.query(Board).filter(Board.workspace_id == workspace_id).count()
+
+    b = _DemoBuilder(session, store, you)
+    b.create_board(workspace_id, position)
+
+    # -- 1. Welcome --------------------------------------------------------
+    welcome = b.task(TODO, "👋 Start here: take the feature tour", b.ago(days=7), PRIYA,
+                     priority=Priority.HIGH.value, labels=["Documentation"], estimated_hours=0.5)
+    banner = b.attach(welcome, "welcome_banner.png", demo_images.welcome_banner(), PRIYA, b.ago(days=7), log=True)
+    welcome.description = f"""![Feature tour banner](attachment:{banner.id})
+
+# Welcome to the Feature Tour
+
+This board is a **hands-on demo** of rich task content. Every card has a little story - open them to explore.
+
+## Things to try
+
+- [x] Open this card (you just did!)
+- [ ] Switch the description editor between **Visual** and **Markdown** and watch the formatting carry over
+- [ ] Open the **Attachments** tab - images get a preview, other files open in their default app
+- [ ] Read the thread in the **Activity** tab, then post a comment of your own
+- [ ] Set the activity filter to **History** to see the complete audit trail
+
+## Formatting cheat sheet
+
+| You type | You get |
+|---|---|
+| `**bold**` | **bold** |
+| `*italic*` | *italic* |
+| `~~strike~~` | ~~strike~~ |
+| `` `code` `` | `code` |
+| `- [ ] item` | a checkbox |
+
+> **Tip:** paste a screenshot straight into the description editor. It is saved as an attachment and shown inline.
+
+New to Markdown? The [CommonMark tutorial](https://commonmark.org/help/) takes ten minutes.
+"""
+    b.log(welcome, A.TASK_UPDATED, PRIYA, b.ago(days=7) + timedelta(minutes=4), "Added a description",
+          "description", "", welcome.description)
+    b.comment(welcome, PRIYA, b.ago(days=6, hours=22),
+              "Welcome aboard! 🎉 Every card on this board demonstrates something different. "
+              "Start with **Design the new onboarding flow** - it has the richest history.")
+    b.comment(welcome, MARCUS, b.ago(days=6, hours=20),
+              "Pro tip: comments support Markdown too - `code`, **bold**, lists and [links](https://commonmark.org).")
+
+    # -- 2. Onboarding flow (richest history) ------------------------------
+    onboarding = b.task(IN_REVIEW, "Design the new onboarding flow", b.ago(days=12), PRIYA, created_in=BACKLOG,
+                        priority=Priority.HIGH.value, estimated_hours=12.0)
+    onboarding.labels = [b.labels["Design"], b.labels["Feature"]]
+    onboarding.due_date = (b.now + timedelta(days=3)).replace(hour=17, minute=0, second=0, microsecond=0)
+    onboarding.start_date = b.ago(days=11).date()
+    onboarding.checklist = [
+        {"id": 1, "text": "Synthesise user research", "done": True},
+        {"id": 2, "text": "Low-fi wireframes", "done": True},
+        {"id": 3, "text": "Hi-fi mockups", "done": True},
+        {"id": 4, "text": "Usability test with 5 users", "done": False},
+    ]
+    b.log(onboarding, A.TASK_UPDATED, PRIYA, b.ago(days=12) + timedelta(minutes=2), "Added labels Design, Feature",
+          "labels", "", "Design, Feature")
+    b.attach(onboarding, "user_research_notes.md", _RESEARCH_NOTES, PRIYA, b.ago(days=12, hours=-1))
+    b.move(onboarding, PRIYA, b.ago(days=11, hours=3), BACKLOG, TODO)
+    b.log(onboarding, A.TASK_UPDATED, PRIYA, b.ago(days=11, hours=3) + timedelta(minutes=1),
+          f"Set due date to {onboarding.due_date.strftime('%b %d, %Y %H:%M')}", "due_date", None,
+          onboarding.due_date.strftime("%b %d, %Y %H:%M"))
+    b.move(onboarding, ELENA, b.ago(days=10), TODO, IN_PROGRESS)
+    # v1 was later replaced by v2, so it only survives in the history
+    b.log(onboarding, A.ATTACHMENT_ADDED, ELENA, b.ago(days=8, hours=5), "Attached 'onboarding_wireframe_v1.png'",
+          "attachment", None, "onboarding_wireframe_v1.png")
+    palette = b.attach(onboarding, "color_palette.png", demo_images.color_palette(), ELENA, b.ago(days=8, hours=5))
+    b.comment(onboarding, ELENA, b.ago(days=8, hours=4),
+              "First pass of the wireframes is attached. I went with a single-column layout so the "
+              "*Create your first board* button is impossible to miss.")
+    b.comment(onboarding, MARCUS, b.ago(days=7, hours=2),
+              "Looks great! One concern: the template picker loads every preview up-front. Can we "
+              "**lazy-load** the previews so the screen renders in under 200 ms?")
+    b.log(onboarding, A.TASK_UPDATED, PRIYA, b.ago(days=7), "Changed priority from Medium to High", "priority",
+          "Medium", "High")
+    wire_v2 = b.attach(onboarding, "onboarding_wireframe_v2.png", demo_images.onboarding_wireframe(), ELENA,
+                       b.ago(days=5, hours=6))
+    b.log(onboarding, A.ATTACHMENT_REMOVED, ELENA, b.ago(days=5, hours=6) + timedelta(minutes=1),
+          "Removed attachment 'onboarding_wireframe_v1.png'", "attachment", "onboarding_wireframe_v1.png", None)
+    b.comment(onboarding, ELENA, b.ago(days=5, hours=5),
+              "Good call - **v2** uses skeleton placeholders for the previews and swaps real thumbnails in "
+              "as they load. I replaced the old wireframe with v2.")
+    onboarding.description = f"""## Goal
+
+Cut time-to-first-board for new users from **~6 minutes to under 2**.
+
+## Proposed flow
+
+1. Welcome screen with a single *Create your first board* call to action
+2. Template picker (Kanban, Sprint, Personal) with lazily loaded previews
+3. Inline tour tooltips on the first board
+
+![Onboarding wireframe v2](attachment:{wire_v2.id})
+
+## Visual direction
+
+Colours follow the existing design tokens - no new palette needed:
+
+![Colour palette](attachment:{palette.id})
+
+## Open questions
+
+- Should the template picker be skippable?
+- Do we localise the tour in v1? See the research notes attachment.
+"""
+    b.log(onboarding, A.TASK_UPDATED, ELENA, b.ago(days=5, hours=4), "Edited the description", "description",
+          "## Goal\n\nFaster onboarding.", onboarding.description)
+    b.log(onboarding, A.TASK_UPDATED, ELENA, b.ago(days=3), "Checklist: checked 'Hi-fi mockups'", "checklist",
+          "2/4 done", "3/4 done")
+    b.move(onboarding, PRIYA, b.ago(days=1, hours=3), IN_PROGRESS, IN_REVIEW)
+    b.comment(onboarding, PRIYA, b.ago(days=1, hours=3),
+              "Moving this to review. @Marcus could you sign off on the technical side by Friday?")
+
+    # -- 3. Crash bug (in progress, urgent, blocks the CDN migration) ------
+    crash = b.task(IN_PROGRESS, "Crash when importing large CSV files", b.ago(days=4), PRIYA, created_in=TODO,
+                   priority=Priority.URGENT.value, labels=["Bug"], estimated_hours=5.0)
+    crash.due_date = (b.now + timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+    shot = b.attach(crash, "crash_dialog.png", demo_images.crash_dialog(), PRIYA, b.ago(days=4) + timedelta(minutes=3))
+    b.attach(crash, "crash_log.txt", _CRASH_LOG.encode(), PRIYA, b.ago(days=4) + timedelta(minutes=3))
+    b.attach(crash, "sample_import.csv", _sample_csv(), MARCUS, b.ago(days=3, hours=2))
+    crash.description = f"""## Summary
+
+Importing a CSV with more than ~50k rows freezes the window and then crashes the app.
+
+## Steps to reproduce
+
+1. Open **Backups & Data** and choose *Import*
+2. Pick `sample_import.csv` (attached)
+3. Wait about 10 seconds
+
+**Expected:** rows import with a progress bar.
+**Actual:** the window stops responding, then the app exits.
+
+![Crash dialog](attachment:{shot.id})
+
+## Stack trace
+
+```text
+Traceback (most recent call last):
+  File "importer.py", line 88, in import_rows
+    rows = list(reader)
+MemoryError
+```
+
+## Fix plan
+
+- [x] Reproduce with the attached sample
+- [ ] Stream rows instead of calling `list(reader)`
+- [ ] Parse on a worker thread and report progress
+- [ ] Add a regression test with 100k rows
+"""
+    b.log(crash, A.TASK_UPDATED, PRIYA, b.ago(days=4) + timedelta(minutes=5), "Added a description",
+          "description", "", crash.description)
+    b.comment(crash, MARCUS, b.ago(days=3, hours=2),
+              "Reproduced. Memory climbs to ~2 GB before the crash because we materialise the whole file "
+              "with `list(reader)`. Attached the file I used.")
+    b.log(crash, A.TASK_UPDATED, PRIYA, b.ago(days=3), "Changed priority from High to Urgent", "priority",
+          "High", "Urgent")
+    b.comment(crash, PRIYA, b.ago(days=3),
+              "This is blocking two enterprise trials - bumping to **Urgent**.")
+    b.move(crash, MARCUS, b.ago(days=2, hours=6), TODO, IN_PROGRESS)
+    b.log(crash, A.TASK_UPDATED, MARCUS, b.ago(days=2, hours=6) + timedelta(minutes=1),
+          f"Set due date to {crash.due_date.strftime('%b %d, %Y %H:%M')}", "due_date", None,
+          crash.due_date.strftime("%b %d, %Y %H:%M"))
+    b.comment(crash, you, b.ago(hours=5),
+              "I can pair on the worker-thread part tomorrow morning. *(This comment is yours - try editing or deleting it.)*")
+
+    # -- 4. Q3 report (done) -----------------------------------------------
+    report = b.task(DONE, "Publish the Q3 performance report", b.ago(days=16), PRIYA, created_in=TODO,
+                    priority=Priority.MEDIUM.value, labels=["Documentation"], estimated_hours=4.0, spent_hours=3.5,
+                    completed_at=b.ago(days=2))
+    chart = b.attach(report, "q3_tasks_completed.png", demo_images.performance_chart(), PRIYA, b.ago(days=5))
+    b.attach(report, "q3_metrics.csv", _Q3_CSV, PRIYA, b.ago(days=5))
+    report.description = f"""## Highlights
+
+- Weekly active boards up **18%** quarter over quarter
+- Median task cycle time down from 4.2 to **3.1 days**
+- Overdue rate at an all-time low
+
+![Tasks completed per month, Apr-Sep](attachment:{chart.id})
+
+| Metric | Q2 | Q3 | Change |
+|---|---|---|---|
+| Tasks completed | 1,240 | 1,530 | +23% |
+| Avg. cycle time | 4.2 d | 3.1 d | -26% |
+| Overdue rate | 9% | 6% | -3 pts |
+
+The raw numbers are in `q3_metrics.csv`.
+"""
+    b.move(report, PRIYA, b.ago(days=9), TODO, IN_PROGRESS)
+    b.log(report, A.TASK_UPDATED, PRIYA, b.ago(days=5), "Added a description", "description", "", report.description)
+    b.move(report, PRIYA, b.ago(days=4), IN_PROGRESS, IN_REVIEW)
+    b.comment(report, MARCUS, b.ago(days=3, hours=4), "Numbers check out against the analytics DB ✅")
+    b.comment(report, ELENA, b.ago(days=3), "Chart colours match the brand palette - good to ship.")
+    b.move(report, PRIYA, b.ago(days=2), IN_REVIEW, DONE)
+    b.log(report, A.TASK_COMPLETED, PRIYA, b.ago(days=2), "Marked as complete", "is_completed", "Open", "Complete")
+
+    # -- 5. Webhook docs ---------------------------------------------------
+    docs = b.task(TODO, "Write API docs for webhooks", b.ago(days=5), MARCUS,
+                  priority=Priority.MEDIUM.value, labels=["Documentation", "Feature"], estimated_hours=6.0,
+                  checklist=[
+                      {"id": 1, "text": "Event catalogue", "done": True},
+                      {"id": 2, "text": "Payload reference", "done": False},
+                      {"id": 3, "text": "Retry & signature verification", "done": False},
+                  ])
+    b.attach(docs, "webhook_payload_example.json", _WEBHOOK_JSON, MARCUS, b.ago(days=5))
+    docs.description = """Document every webhook event so integrators can build without asking us.
+
+## Example payload
+
+```json
+{
+  "event": "task.moved",
+  "task": { "id": 1337, "from_column": "In Review", "to_column": "Done" }
+}
+```
+
+## Must cover
+
+1. Event catalogue
+2. Payload reference (full example attached)
+3. **Retries** - exponential backoff, at most 5 attempts
+4. **Signatures** - HMAC-SHA256 in the `X-Kanban-Signature` header
+"""
+    b.log(docs, A.TASK_UPDATED, MARCUS, b.ago(days=5) + timedelta(minutes=10), "Added a description",
+          "description", "", docs.description)
+    b.comment(docs, PRIYA, b.ago(days=4), "Can we include a copy-pasteable signature check in Python and Node?")
+    b.comment(docs, MARCUS, b.ago(days=4, hours=-2), "Yes - adding both to the retry section.",
+              edited=b.ago(days=4, hours=-3))
+    b.log(docs, A.COMMENT_EDITED, MARCUS, b.ago(days=4, hours=-3), "Edited a comment: Yes - adding both to the retry section.",
+          "comment", "Yes, will do.", "Yes - adding both to the retry section.")
+    b.log(docs, A.TASK_UPDATED, MARCUS, b.ago(days=2), "Checklist: checked 'Event catalogue'", "checklist",
+          "0/3 done", "1/3 done")
+
+    # -- 6. CDN migration (blocked by the crash fix) ------------------------
+    cdn = b.task(BACKLOG, "Migrate attachment storage to the CDN", b.ago(days=3), MARCUS,
+                 priority=Priority.MEDIUM.value, labels=["Refactor", "Improvement"], estimated_hours=16.0)
+    cdn.description = """> Large uploads should never block the UI thread.
+> - *Storage RFC, section 2*
+
+Move attachment blobs from local disk to the CDN while keeping the **content-addressed** layout
+(`sha256` file names), so existing links keep working.
+
+Blocked by the CSV import crash: both changes touch the same file-streaming code.
+"""
+    session.add(TaskDependency(task_id=cdn.id, depends_on_task_id=crash.id))
+    b.log(cdn, A.DEPENDENCY_ADDED, MARCUS, b.ago(days=3) + timedelta(minutes=2),
+          f"Marked as blocked by #{crash.id} '{crash.title}'", "dependency", None, crash.title)
+
+    # -- 7. Recurring sync --------------------------------------------------
+    sync_due = (b.now + timedelta(days=(4 - b.now.weekday()) % 7 or 7)).replace(hour=10, minute=0, second=0,
+                                                                                  microsecond=0)
+    sync = b.task(BACKLOG, "Weekly team sync", b.ago(days=20), PRIYA, priority=Priority.LOW.value,
+                  is_recurring=True, due_date=sync_due,
+                  recurrence_rule_json=json.dumps({"frequency": RecurrenceFrequency.WEEKLY.value, "interval": 1}))
+    b.attach(sync, "meeting_notes_template.md", _MEETING_TEMPLATE, PRIYA, b.ago(days=20))
+    sync.description = """Every Friday at 10:00. Copy the attached template into a comment after each meeting.
+
+## Agenda
+
+1. Wins from the week
+2. Blockers (anything older than 2 days gets an owner)
+3. Next week's priorities
+"""
+    b.log(sync, A.TASK_UPDATED, PRIYA, b.ago(days=20) + timedelta(minutes=1), "Set to repeat: Weekly", "recurrence",
+          "Does not repeat", "Weekly")
+    b.comment(sync, PRIYA, b.ago(days=6),
+              "**Notes - last week**\n\n- Wins: Q3 report drafted\n- Blockers: CSV import crash\n"
+              "- Action: Marcus to investigate memory usage")
+
+    # -- 8. Try it yourself --------------------------------------------------
+    play = b.task(TODO, "✏️ Your turn: edit this card", b.ago(hours=1), you, priority=Priority.LOW.value,
+                  labels=["Improvement"])
+    play.description = """This card is yours to experiment with. Nothing here matters, so go wild:
+
+- Make some text **bold**, add a heading, or turn lines into a checklist
+- Press **Ctrl+K** to add a link
+- Drag an image from your file manager into this editor, or paste a screenshot
+- Save, reopen, and check the **History** filter - every change you made is recorded
+"""
+    b.log(play, A.TASK_UPDATED, you, b.ago(hours=1) + timedelta(minutes=1), "Added a description", "description",
+          "", play.description)
+
+    session.flush()
+    return b.board
