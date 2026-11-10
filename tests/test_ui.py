@@ -1,30 +1,19 @@
 """
 UI Integration Tests for MainWindow, Views, and Widgets
 """
-import os
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from kanbanmanager.database.connection import DatabaseManager
 from kanbanmanager import DatabaseService
 from kanbanmanager.ui import MainWindow
 from kanbanmanager import ViewMode
-
-
-@pytest.fixture(scope="session")
-def qapp():
-    os.environ["QT_QPA_PLATFORM"] = "offscreen"
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication([])
-    return app
+from support import seeded_manager
 
 
 @pytest.fixture
 def main_window(qapp, tmp_path):
     db_file = tmp_path / "ui_test.db"
-    mgr = DatabaseManager(db_file)
-    mgr.init_database(seed_defaults=True)
+    mgr = seeded_manager(db_file)
     service = DatabaseService(mgr)
 
     win = MainWindow(service=service)
@@ -97,3 +86,11 @@ def test_filter_bar_controls_fit_without_overlap(main_window, window_width):
         assert btn.width() >= btn.sizeHint().width(), f"'{btn.text()}' is truncated"
     for combo in (bar.priority_combo, bar.label_combo, bar.due_combo, bar.status_combo):
         assert combo.width() >= combo.fontMetrics().horizontalAdvance(combo.itemText(0)) + 40
+
+    # The stats bar below must not truncate its labels either (it switches to compact wording)
+    main_window.stats_bar.set_automation_counts(4, 2, 13)
+    QApplication.processEvents()
+    stats = main_window.stats_bar
+    for w in (stats.total_lbl, stats.wip_lbl, stats.completed_lbl, stats.overdue_lbl, stats.blocked_lbl,
+              stats.automations_btn, stats.archive_btn):
+        assert w.width() >= w.sizeHint().width() - 1, f"'{w.text()}' is truncated at {window_width}px"

@@ -1,15 +1,24 @@
 """
 Core Application Logic Package
-"""
-from kanbanmanager.core.signals import app_signals, AppSignals
-from kanbanmanager.core.recurrence import RecurrenceEngine
-from kanbanmanager.core.backup_manager import BackupManager
-from kanbanmanager.core.reminder_engine import ReminderEngine
 
-__all__ = [
-    "app_signals",
-    "AppSignals",
-    "RecurrenceEngine",
-    "BackupManager",
-    "ReminderEngine",
-]
+Exports are resolved lazily, so importing a pure module such as
+``kanbanmanager.core.custom_fields`` (which the database layer uses) does not
+pull in the backup manager and, through it, the database service.
+"""
+from importlib import import_module
+
+_EXPORTS = {
+    "app_signals": "kanbanmanager.core.signals",
+    "AppSignals": "kanbanmanager.core.signals",
+    "RecurrenceEngine": "kanbanmanager.core.recurrence",
+    "BackupManager": "kanbanmanager.core.backup_manager",
+    "ReminderEngine": "kanbanmanager.core.reminder_engine",
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name):
+    if name in _EXPORTS:
+        return getattr(import_module(_EXPORTS[name]), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

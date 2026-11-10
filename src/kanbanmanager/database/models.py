@@ -92,8 +92,25 @@ class Board(Base):
     is_archived = SAColumn(Boolean, default=False, nullable=False)
     created_at = SAColumn(DateTime, default=utc_now, nullable=False)
     updated_at = SAColumn(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+    # Auto-archiving & stale-task policies (see core.automation.DEFAULT_POLICIES)
+    policies_json = SAColumn(Text, default="{}", nullable=False)
+    # Working calendar, cascading and compared baseline (see core.scheduling.DEFAULT_SCHEDULE_SETTINGS)
+    schedule_json = SAColumn(Text, default="{}", nullable=False)
 
     workspace = relationship("Workspace", back_populates="boards")
+    automation_rules = relationship(
+        "AutomationRule",
+        back_populates="board",
+        cascade="all, delete-orphan",
+        order_by="AutomationRule.position",
+    )
+    automation_runs = relationship("AutomationRun", cascade="all, delete-orphan")
+    baselines = relationship("ProjectBaseline", back_populates="board", cascade="all, delete-orphan",
+                             order_by="ProjectBaseline.created_at")
+    custom_fields = relationship("CustomField", back_populates="board", cascade="all, delete-orphan",
+                                 order_by="CustomField.position")
+    task_templates = relationship("TaskTemplate", back_populates="board", cascade="all, delete-orphan",
+                                  order_by="TaskTemplate.position")
     columns = relationship(
         "BoardColumn",
         back_populates="board",
@@ -117,6 +134,28 @@ class Board(Base):
         cascade="all, delete-orphan",
         order_by="ActivityLog.timestamp.desc()",
     )
+
+    @property
+    def schedule_settings(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self.schedule_json or "{}")
+        except Exception:
+            return {}
+
+    @schedule_settings.setter
+    def schedule_settings(self, val: Dict[str, Any]) -> None:
+        self.schedule_json = json.dumps(val or {})
+
+    @property
+    def policies(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self.policies_json or "{}")
+        except Exception:
+            return {}
+
+    @policies.setter
+    def policies(self, val: Dict[str, Any]) -> None:
+        self.policies_json = json.dumps(val or {})
 
     def to_dict(self, include_details: bool = True) -> Dict[str, Any]:
         data = {
@@ -170,7 +209,9 @@ class BoardColumn(Base):
     def allowed_transitions(self, val: List[int]) -> None:
         self.allowed_transitions_json = json.dumps(val or [])
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, include_count: bool = True) -> Dict[str, Any]:
+        """``include_count``: count the column's open tasks (reads ``tasks``; leave it out
+        for columns loaded without their tasks)."""
         return {
             "id": self.id,
             "board_id": self.board_id,
@@ -182,7 +223,7 @@ class BoardColumn(Base):
             "is_collapsed": self.is_collapsed,
             "is_done_column": self.is_done_column,
             "allowed_transitions": self.allowed_transitions,
-            "task_count": len(self.tasks),
+            **({"task_count": sum(1 for t in self.tasks if not t.is_archived)} if include_count else {}),
         }
 
 
@@ -238,6 +279,16 @@ class Task(Base):
     # Person responsible (free-form display name; capacity lives in TeamMember)
     assignee = SAColumn(String(120), nullable=True)
 
+    # Archived tasks are hidden from every view but kept (restorable, still in history)
+    is_archived = SAColumn(Boolean, default=False, nullable=False, server_default="0")
+    archived_at = SAColumn(DateTime, nullable=True)
+    archive_reason = SAColumn(String(200), nullable=True)
+
+    # Scheduling: milestones have zero duration; locked tasks are never moved by
+    # auto-scheduling or cascading date shifts
+    is_milestone = SAColumn(Boolean, default=False, nullable=False, server_default="0")
+    dates_locked = SAColumn(Boolean, default=False, nullable=False, server_default="0")
+
     created_at = SAColumn(DateTime, default=utc_now, nullable=False)
     updated_at = SAColumn(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
@@ -263,6 +314,13 @@ class Task(Base):
         back_populates="task",
         cascade="all, delete-orphan",
         order_by="TimeEntry.started_at",
+    )
+    # Custom field values; always loaded with the task (one extra IN query per batch of tasks)
+    field_values = relationship(
+        "TaskFieldValue",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
 
     # Dependencies: tasks that this task depends on (this task is blocked by)
@@ -291,16 +349,21 @@ class Task(Base):
     def checklist(self, val: List[Dict[str, Any]]) -> None:
         self.checklist_json = json.dumps(val or [])
 
+    def _field_value_rows(self) -> List["TaskFieldValue"]:
+        if "field_values" in sa_inspect(self).unloaded:  # detached without them: never lazy-load
+            return []
+        return [fv for fv in self.field_values if fv.field is not None]
+
+    @property
+    def field_value_map(self) -> Dict[int, Any]:
+        """Custom field values by field id."""
+        return {fv.field_id: fv.value for fv in self._field_value_rows()}
+
     @property
     def custom_fields(self) -> Dict[str, Any]:
-        try:
-            return json.loads(self.custom_fields_json or "{}")
-        except Exception:
-            return {}
-
-    @custom_fields.setter
-    def custom_fields(self, val: Dict[str, Any]) -> None:
-        self.custom_fields_json = json.dumps(val or {})
+        """Custom field values by field name (``custom_fields_json`` is the pre-typed-fields legacy
+        store; the migration moves its contents into real fields)."""
+        return {fv.field.name: fv.value for fv in sorted(self._field_value_rows(), key=lambda r: r.field.position)}
 
     @property
     def recurrence_rule(self) -> Dict[str, Any]:
@@ -327,8 +390,18 @@ class Task(Base):
 
     @property
     def is_blocked(self) -> bool:
-        """Returns True if any prerequisite task is not completed."""
+        """True if a finish-to-start prerequisite is not completed yet.
+
+        Start-to-start, finish-to-finish and start-to-finish links constrain the
+        schedule but don't prevent starting the task, so they don't block it.
+        """
         for dep in self.prerequisites:
+            try:
+                kind = DependencyType(dep.dependency_type).scheduling_type
+            except ValueError:
+                kind = DependencyType.FINISH_TO_START
+            if kind != DependencyType.FINISH_TO_START:
+                continue
             if dep.prerequisite_task and not dep.prerequisite_task.is_completed:
                 return True
         return False
@@ -350,12 +423,18 @@ class Task(Base):
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "checklist": self.checklist,
             "custom_fields": self.custom_fields,
+            "field_values": self.field_value_map,
             "is_recurring": self.is_recurring,
             "recurrence_rule": self.recurrence_rule,
             "labels": [lbl.to_dict() for lbl in self.labels],
             "is_overdue": self.is_overdue,
             "is_blocked": self.is_blocked,
             "assignee": self.assignee or "",
+            "is_archived": bool(self.is_archived),
+            "archived_at": self.archived_at.isoformat() if self.archived_at else None,
+            "archive_reason": self.archive_reason or "",
+            "is_milestone": bool(self.is_milestone),
+            "dates_locked": bool(self.dates_locked),
             "comment_count": self._loaded_int("comment_count"),
             "attachment_count": self._loaded_int("attachment_count"),
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -367,6 +446,7 @@ class Task(Base):
                     "title": p.prerequisite_task.title if p.prerequisite_task else "",
                     "is_completed": p.prerequisite_task.is_completed if p.prerequisite_task else False,
                     "dependency_type": p.dependency_type,
+                    "lag_days": int(p.lag_days or 0),
                 }
                 for p in self.prerequisites
             ],
@@ -390,6 +470,7 @@ class TaskDependency(Base):
     task_id = SAColumn(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
     depends_on_task_id = SAColumn(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
     dependency_type = SAColumn(String(30), default=DependencyType.FINISH_TO_START.value, nullable=False)
+    lag_days = SAColumn(Integer, default=0, nullable=False, server_default="0")  # working days; negative = lead
     created_at = SAColumn(DateTime, default=utc_now, nullable=False)
 
     __table_args__ = (
@@ -597,6 +678,495 @@ class TeamMember(Base):
             "name": self.name,
             "weekly_capacity_hours": float(self.weekly_capacity_hours or 0.0),
             "working_days": self.working_days,
+        }
+
+
+class AutomationRule(Base):
+    """'When <trigger> and <conditions> then <actions>' for one board.
+
+    trigger/conditions/actions are JSON; their vocabulary lives in core.automation.
+    """
+
+    __tablename__ = "automation_rules"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    board_id = SAColumn(Integer, ForeignKey("boards.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = SAColumn(String(120), nullable=False)
+    is_enabled = SAColumn(Boolean, default=True, nullable=False)
+    position = SAColumn(Integer, default=0, nullable=False)
+    trigger_json = SAColumn(Text, default="{}", nullable=False)
+    conditions_json = SAColumn(Text, default="[]", nullable=False)
+    actions_json = SAColumn(Text, default="[]", nullable=False)
+    run_count = SAColumn(Integer, default=0, nullable=False)
+    last_run_at = SAColumn(DateTime, nullable=True)
+    created_at = SAColumn(DateTime, default=utc_now, nullable=False)
+    updated_at = SAColumn(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    board = relationship("Board", back_populates="automation_rules")
+
+    @staticmethod
+    def _load(raw: str, default):
+        try:
+            value = json.loads(raw or "")
+            return value if isinstance(value, type(default)) else default
+        except Exception:
+            return default
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "board_id": self.board_id,
+            "name": self.name,
+            "is_enabled": bool(self.is_enabled),
+            "position": self.position,
+            "trigger": self._load(self.trigger_json, {}),
+            "conditions": self._load(self.conditions_json, []),
+            "actions": self._load(self.actions_json, []),
+            "run_count": int(self.run_count or 0),
+            "last_run_at": self.last_run_at.isoformat() if self.last_run_at else None,
+        }
+
+
+class AutomationRun(Base):
+    """Execution history of rules and policies (also used to avoid firing twice)."""
+
+    __tablename__ = "automation_runs"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    board_id = SAColumn(Integer, ForeignKey("boards.id", ondelete="CASCADE"), nullable=False, index=True)
+    rule_id = SAColumn(Integer, ForeignKey("automation_rules.id", ondelete="SET NULL"), nullable=True)
+    source = SAColumn(String(40), nullable=False, default="rule")  # 'rule' or a policy name
+    rule_name = SAColumn(String(120), nullable=False, default="")
+    task_id = SAColumn(Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True)
+    task_title = SAColumn(String(255), nullable=True)
+    trigger = SAColumn(String(40), nullable=False, default="")
+    status = SAColumn(String(20), nullable=False, default="success")  # success | partial | failed | skipped
+    message = SAColumn(Text, nullable=True)
+    dedupe_key = SAColumn(String(200), nullable=True, index=True)
+    created_at = SAColumn(DateTime, default=utc_now, nullable=False, index=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "board_id": self.board_id,
+            "rule_id": self.rule_id,
+            "source": self.source,
+            "rule_name": self.rule_name,
+            "task_id": self.task_id,
+            "task_title": self.task_title or "",
+            "trigger": self.trigger,
+            "status": self.status,
+            "message": self.message or "",
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class ProjectBaseline(Base):
+    """A saved snapshot of a board's planned dates, to compare the current plan against."""
+
+    __tablename__ = "project_baselines"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    board_id = SAColumn(Integer, ForeignKey("boards.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = SAColumn(String(120), nullable=False)
+    created_by = SAColumn(String(120), nullable=True)
+    created_at = SAColumn(DateTime, default=utc_now, nullable=False)
+
+    board = relationship("Board", back_populates="baselines")
+    entries = relationship("BaselineEntry", back_populates="baseline", cascade="all, delete-orphan")
+
+    def to_dict(self, include_entries: bool = False) -> Dict[str, Any]:
+        data = {
+            "id": self.id,
+            "board_id": self.board_id,
+            "name": self.name,
+            "created_by": self.created_by or "",
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "task_count": len(self.entries),
+        }
+        if include_entries:
+            data["entries"] = [e.to_dict() for e in self.entries]
+        return data
+
+
+class BaselineEntry(Base):
+    __tablename__ = "baseline_entries"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    baseline_id = SAColumn(Integer, ForeignKey("project_baselines.id", ondelete="CASCADE"), nullable=False,
+                           index=True)
+    task_id = SAColumn(Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True)
+    title = SAColumn(String(255), nullable=False)
+    start_date = SAColumn(Date, nullable=False)
+    finish_date = SAColumn(Date, nullable=False)
+    duration_days = SAColumn(Integer, nullable=False, default=0)
+    is_milestone = SAColumn(Boolean, nullable=False, default=False)
+
+    baseline = relationship("ProjectBaseline", back_populates="entries")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "title": self.title,
+            "start_date": self.start_date.isoformat(),
+            "finish_date": self.finish_date.isoformat(),
+            "duration_days": self.duration_days,
+            "is_milestone": bool(self.is_milestone),
+        }
+
+
+class CustomField(Base):
+    """A board-defined task field ("Story points", "Severity" ...). ``field_type`` is a key of the
+    extensible registry in core.custom_fields; ``config_json`` holds type settings (options, unit ...)."""
+
+    __tablename__ = "custom_fields"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    board_id = SAColumn(Integer, ForeignKey("boards.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = SAColumn(String(60), nullable=False)
+    field_type = SAColumn(String(40), nullable=False, default="text")
+    config_json = SAColumn(Text, nullable=False, default="{}")
+    description = SAColumn(Text, nullable=False, default="")
+    required = SAColumn(Boolean, nullable=False, default=False)
+    default_json = SAColumn(Text, nullable=True)          # JSON value given to new tasks (NULL = none)
+    show_on_card = SAColumn(Boolean, nullable=False, default=True)
+    position = SAColumn(Integer, nullable=False, default=0)
+    created_at = SAColumn(DateTime, default=utc_now, nullable=False)
+
+    __table_args__ = (UniqueConstraint("board_id", "name", name="uq_custom_field_name"),)
+
+    board = relationship("Board", back_populates="custom_fields")
+    values = relationship("TaskFieldValue", back_populates="field", cascade="all, delete-orphan",
+                          passive_deletes=True)
+
+    @property
+    def config(self) -> Dict[str, Any]:
+        try:
+            value = json.loads(self.config_json or "{}")
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    @config.setter
+    def config(self, val: Dict[str, Any]) -> None:
+        self.config_json = json.dumps(val or {}, ensure_ascii=False)
+
+    @property
+    def default(self) -> Any:
+        try:
+            return json.loads(self.default_json) if self.default_json else None
+        except Exception:
+            return None
+
+    @default.setter
+    def default(self, val: Any) -> None:
+        self.default_json = None if val is None else json.dumps(val, ensure_ascii=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        from kanbanmanager.core.custom_fields import get_field_type
+
+        ftype = get_field_type(self.field_type)
+        return {
+            "id": self.id,
+            "board_id": self.board_id,
+            "name": self.name,
+            "field_type": self.field_type,
+            "type_label": ftype.label,
+            "icon": ftype.icon,
+            "config": self.config,
+            "description": self.description or "",
+            "required": bool(self.required),
+            "default": self.default,
+            "show_on_card": bool(self.show_on_card),
+            "position": self.position,
+        }
+
+
+class TaskFieldValue(Base):
+    """The value of one custom field on one task (JSON; see core.custom_fields)."""
+
+    __tablename__ = "task_field_values"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    task_id = SAColumn(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    field_id = SAColumn(Integer, ForeignKey("custom_fields.id", ondelete="CASCADE"), nullable=False, index=True)
+    value_json = SAColumn(Text, nullable=False, default="null")
+    updated_at = SAColumn(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    __table_args__ = (UniqueConstraint("task_id", "field_id", name="uq_task_field_value"),)
+
+    task = relationship("Task", back_populates="field_values")
+    field = relationship("CustomField", back_populates="values", lazy="joined")
+
+    @property
+    def value(self) -> Any:
+        try:
+            return json.loads(self.value_json)
+        except Exception:
+            return None
+
+    @value.setter
+    def value(self, val: Any) -> None:
+        self.value_json = json.dumps(val, ensure_ascii=False)
+
+
+class TaskTemplate(Base):
+    """A reusable task preset (title pattern, description, checklist, labels, field values ...).
+    ``board_id`` NULL = available on every board. See core.templates for the data format."""
+
+    __tablename__ = "task_templates"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    board_id = SAColumn(Integer, ForeignKey("boards.id", ondelete="CASCADE"), nullable=True, index=True)
+    name = SAColumn(String(120), nullable=False)
+    icon = SAColumn(String(16), nullable=False, default="📋")
+    data_json = SAColumn(Text, nullable=False, default="{}")
+    position = SAColumn(Integer, nullable=False, default=0)
+    created_by = SAColumn(String(120), nullable=True)
+    created_at = SAColumn(DateTime, default=utc_now, nullable=False)
+    updated_at = SAColumn(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    board = relationship("Board", back_populates="task_templates")
+
+    @property
+    def data(self) -> Dict[str, Any]:
+        try:
+            value = json.loads(self.data_json or "{}")
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    @data.setter
+    def data(self, val: Dict[str, Any]) -> None:
+        self.data_json = json.dumps(val or {}, ensure_ascii=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "board_id": self.board_id,
+            "name": self.name,
+            "icon": self.icon or "📋",
+            "data": self.data,
+            "position": self.position,
+            "created_by": self.created_by or "",
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class BoardTemplate(Base):
+    """A board blueprint saved by the user (built-in templates live in core.templates).
+    ``data_json`` uses the portable template format (columns, labels, fields, task templates,
+    automation, sample tasks), so templates can be exported and shared as files."""
+
+    __tablename__ = "board_templates"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    name = SAColumn(String(120), nullable=False)
+    description = SAColumn(Text, nullable=False, default="")
+    icon = SAColumn(String(16), nullable=False, default="📋")
+    color = SAColumn(String(20), nullable=False, default="#3B82F6")
+    category = SAColumn(String(60), nullable=False, default="My templates")
+    data_json = SAColumn(Text, nullable=False, default="{}")
+    created_by = SAColumn(String(120), nullable=True)
+    created_at = SAColumn(DateTime, default=utc_now, nullable=False)
+    updated_at = SAColumn(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    @property
+    def data(self) -> Dict[str, Any]:
+        try:
+            value = json.loads(self.data_json or "{}")
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    @data.setter
+    def data(self, val: Dict[str, Any]) -> None:
+        self.data_json = json.dumps(val or {}, ensure_ascii=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description or "",
+            "icon": self.icon or "📋",
+            "color": self.color,
+            "category": self.category or "My templates",
+            "data": self.data,
+            "created_by": self.created_by or "",
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "builtin": False,
+        }
+
+
+class InboxItem(Base):
+    """A quickly captured thought waiting to be triaged into a board (the Global Inbox).
+
+    The raw text is kept; the parsed hints (due date, priority, labels, assignee,
+    target board) are stored so triage can apply them.
+    """
+
+    __tablename__ = "inbox_items"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    raw_text = SAColumn(Text, nullable=False, default="")
+    title = SAColumn(String(255), nullable=False)
+    notes = SAColumn(Text, nullable=True)
+    priority = SAColumn(String(20), nullable=True)
+    due_date = SAColumn(DateTime, nullable=True)          # local time, like Task.due_date
+    labels_json = SAColumn(Text, nullable=False, default="[]")
+    assignee = SAColumn(String(120), nullable=True)
+    board_hint_id = SAColumn(Integer, ForeignKey("boards.id", ondelete="SET NULL"), nullable=True)
+    source = SAColumn(String(40), nullable=False, default="quick_capture")
+    captured_by = SAColumn(String(120), nullable=True)
+    created_at = SAColumn(DateTime, default=utc_now, nullable=False)
+
+    @property
+    def labels(self) -> List[str]:
+        try:
+            return [str(x) for x in json.loads(self.labels_json or "[]")]
+        except Exception:
+            return []
+
+    @labels.setter
+    def labels(self, val: List[str]) -> None:
+        self.labels_json = json.dumps(list(val or []))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "raw_text": self.raw_text or "",
+            "title": self.title,
+            "notes": self.notes or "",
+            "priority": self.priority,
+            "due_date": self.due_date.isoformat() if self.due_date else None,
+            "labels": self.labels,
+            "assignee": self.assignee or "",
+            "board_hint_id": self.board_hint_id,
+            "source": self.source,
+            "captured_by": self.captured_by or "",
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class CalendarSubscription(Base):
+    """A calendar this app syncs with: an iCalendar feed URL (read) or a CalDAV calendar
+    (read/write). Items are mapped to tasks on ``board_id`` (see core.calendar_sync)."""
+
+    __tablename__ = "calendar_subscriptions"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    name = SAColumn(String(120), nullable=False)
+    kind = SAColumn(String(20), nullable=False, default="ics")           # ics | caldav
+    url = SAColumn(Text, nullable=False)
+    username = SAColumn(String(200), nullable=True)
+    password = SAColumn(Text, nullable=True)
+    board_id = SAColumn(Integer, ForeignKey("boards.id", ondelete="CASCADE"), nullable=False, index=True)
+    column_id = SAColumn(Integer, ForeignKey("board_columns.id", ondelete="SET NULL"), nullable=True)
+    direction = SAColumn(String(20), nullable=False, default="pull")     # pull | push | two_way
+    interval_minutes = SAColumn(Integer, nullable=False, default=30)     # 0 = manual only
+    enabled = SAColumn(Boolean, nullable=False, default=True)
+    options_json = SAColumn(Text, nullable=False, default="{}")
+    last_sync_at = SAColumn(DateTime, nullable=True)                    # naive UTC
+    last_status = SAColumn(String(20), nullable=True)                   # success | partial | failed
+    last_message = SAColumn(Text, nullable=True)
+    created_at = SAColumn(DateTime, default=utc_now, nullable=False)
+
+    @property
+    def options(self) -> Dict[str, Any]:
+        try:
+            value = json.loads(self.options_json or "{}")
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    @options.setter
+    def options(self, val: Dict[str, Any]) -> None:
+        self.options_json = json.dumps(val or {})
+
+    def to_dict(self, include_secret: bool = False) -> Dict[str, Any]:
+        data = {
+            "id": self.id,
+            "name": self.name,
+            "kind": self.kind,
+            "url": self.url,
+            "username": self.username or "",
+            "has_password": bool(self.password),
+            "board_id": self.board_id,
+            "column_id": self.column_id,
+            "direction": self.direction,
+            "interval_minutes": int(self.interval_minutes or 0),
+            "enabled": bool(self.enabled),
+            "options": self.options,
+            "last_sync_at": self.last_sync_at.isoformat() if self.last_sync_at else None,
+            "last_status": self.last_status,
+            "last_message": self.last_message or "",
+        }
+        if include_secret:
+            data["password"] = self.password or ""
+        return data
+
+
+class ExternalLink(Base):
+    """Sync state of one task <-> one item elsewhere (a calendar entry, an imported card ...).
+
+    ``source`` identifies where ("sub:<id>" for a calendar subscription, "ics-file",
+    "trello:<board>" ...). ``task_id`` becomes NULL when the task is deleted, which tells
+    the next sync to delete the remote copy. ``local_hash`` / ``remote_hash`` are the
+    states both sides had at the last sync, to tell who changed what since.
+    """
+
+    __tablename__ = "external_links"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    source = SAColumn(String(80), nullable=False)
+    subscription_id = SAColumn(Integer, ForeignKey("calendar_subscriptions.id", ondelete="CASCADE"), nullable=True,
+                               index=True)
+    uid = SAColumn(String(500), nullable=False)
+    task_id = SAColumn(Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True)
+    href = SAColumn(Text, nullable=True)
+    etag = SAColumn(String(200), nullable=True)
+    local_hash = SAColumn(String(64), nullable=True)
+    remote_hash = SAColumn(String(64), nullable=True)
+    remote_data = SAColumn(Text, nullable=True)          # last remote iCalendar text (to write back faithfully)
+    last_synced_at = SAColumn(DateTime, nullable=True)
+
+    __table_args__ = (UniqueConstraint("source", "uid", name="uq_external_link"),)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id, "source": self.source, "subscription_id": self.subscription_id, "uid": self.uid,
+            "task_id": self.task_id, "href": self.href, "etag": self.etag, "local_hash": self.local_hash,
+            "remote_hash": self.remote_hash, "remote_data": self.remote_data,
+            "last_synced_at": self.last_synced_at.isoformat() if self.last_synced_at else None,
+        }
+
+
+class SyncRun(Base):
+    """History of calendar sync runs."""
+
+    __tablename__ = "sync_runs"
+
+    id = SAColumn(Integer, primary_key=True, autoincrement=True)
+    subscription_id = SAColumn(Integer, ForeignKey("calendar_subscriptions.id", ondelete="CASCADE"), nullable=False,
+                               index=True)
+    started_at = SAColumn(DateTime, default=utc_now, nullable=False)
+    finished_at = SAColumn(DateTime, nullable=True)
+    status = SAColumn(String(20), nullable=False, default="success")
+    created = SAColumn(Integer, nullable=False, default=0)      # local tasks created
+    updated = SAColumn(Integer, nullable=False, default=0)      # local tasks updated
+    removed = SAColumn(Integer, nullable=False, default=0)      # local tasks archived/deleted
+    pushed = SAColumn(Integer, nullable=False, default=0)       # remote items created/updated/deleted
+    conflicts = SAColumn(Integer, nullable=False, default=0)
+    message = SAColumn(Text, nullable=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id, "subscription_id": self.subscription_id,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            "status": self.status, "created": self.created, "updated": self.updated, "removed": self.removed,
+            "pushed": self.pushed, "conflicts": self.conflicts, "message": self.message or "",
         }
 
 

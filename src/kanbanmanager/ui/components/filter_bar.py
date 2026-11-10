@@ -50,6 +50,7 @@ class FilterBar(QFrame):
         top_row = QHBoxLayout()
         top_row.setSpacing(12)
         filter_row = QHBoxLayout()
+        self.filter_row = filter_row
         filter_row.setSpacing(8)
         main_layout.addLayout(top_row)
         main_layout.addLayout(filter_row)
@@ -59,7 +60,7 @@ class FilterBar(QFrame):
         # ---------------------------------------------------------------------
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("🔍 Search tasks...")
-        self.search_input.setToolTip("Search tasks by title or description (Ctrl+F)")
+        self.search_input.setToolTip("Search tasks by title, description or custom field values (Ctrl+F)")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setMinimumWidth(self.SEARCH_MIN_WIDTH)
         self.search_input.setMaximumWidth(self.SEARCH_MAX_WIDTH)
@@ -104,7 +105,16 @@ class FilterBar(QFrame):
         self.status_combo.addItem("Completed Only", True)
         self.status_combo.currentIndexChanged.connect(self._emit_filters)
 
-        for combo in (self.priority_combo, self.label_combo, self.due_combo, self.status_combo):
+        # ---------------------------------------------------------------------
+        # Custom Field Filter (only shown when the board has fields)
+        # ---------------------------------------------------------------------
+        self.field_combo = QComboBox()
+        self.field_combo.addItem("All Fields", None)
+        self.field_combo.setToolTip("Filter by a custom field value")
+        self.field_combo.currentIndexChanged.connect(self._emit_filters)
+        self.field_combo.setVisible(False)
+
+        for combo in (self.priority_combo, self.label_combo, self.due_combo, self.status_combo, self.field_combo):
             # Natural width when there is room. When space is tight it may shrink, but
             # never so far that its default "All ..." text is clipped or widgets overlap.
             default_text_width = combo.fontMetrics().horizontalAdvance(combo.itemText(0))
@@ -151,7 +161,8 @@ class FilterBar(QFrame):
 
         self.btn_board = view_button("📋 Board", "Kanban board view")
         self.btn_calendar = view_button("📅 Calendar", "Month/week calendar of due dates")
-        self.btn_timeline = view_button("📈 Timeline", "Timeline / Gantt view with dependencies")
+        self.btn_timeline = view_button("📈 Gantt", "Gantt chart: critical path, dependencies, milestones, "
+                                                   "auto-scheduling and baselines")
         self.btn_analytics = view_button("📊 Analytics", "Board metrics and activity")
         self.btn_workload = view_button("👥 Workload", "Team workload, capacity planning and timesheets")
         self.btn_board.setChecked(True)
@@ -163,6 +174,25 @@ class FilterBar(QFrame):
         self.btn_workload.clicked.connect(lambda: app_signals.view_mode_changed.emit(ViewMode.WORKLOAD.value))
 
         top_row.addWidget(switcher)
+
+    RESET_FULL, RESET_COMPACT = "✕ Clear", "✕"
+
+    def _fit_filter_row(self) -> None:
+        """Shorten "✕ Clear" to "✕" when the filters (incl. the field filter) would not fit."""
+        combos = [c for c in (self.priority_combo, self.label_combo, self.due_combo, self.status_combo,
+                              self.field_combo) if not c.isHidden()]
+        spacing = self.filter_row.spacing() * len(combos)
+        margins = self.layout().contentsMargins()
+        available = self.contentsRect().width() - margins.left() - margins.right()
+        full = self.reset_btn.fontMetrics().horizontalAdvance(self.RESET_FULL) + 40
+        needed = sum(c.minimumWidth() for c in combos) + spacing + full
+        text = self.RESET_FULL if needed <= available else self.RESET_COMPACT
+        if self.reset_btn.text() != text:
+            self.reset_btn.setText(text)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_filter_row()
 
     def set_view_mode(self, mode: str) -> None:
         """Reflect the active view in the switcher (also when changed programmatically)."""
@@ -191,12 +221,33 @@ class FilterBar(QFrame):
             self.label_combo.setCurrentIndex(idx)
         self.label_combo.blockSignals(False)
 
+    def set_board_fields(self, fields: List[Dict[str, Any]], values_in_use: Optional[Dict[int, list]] = None) -> None:
+        """Offer each field's filter choices ("Severity: is Critical", "Story points: is empty" ...)."""
+        from kanbanmanager.core import custom_fields as cf
+
+        current = self.field_combo.currentData()
+        self.field_combo.blockSignals(True)
+        self.field_combo.clear()
+        self.field_combo.addItem("All Fields", None)
+        for f in fields:
+            ftype = cf.type_of(f)
+            for key, label in ftype.filter_choices(f.get("config") or {}, (values_in_use or {}).get(f["id"], [])):
+                self.field_combo.addItem(f"{f['icon']} {f['name']}: {label}", f"{f['id']}|{key}")
+        idx = self.field_combo.findData(current)
+        self.field_combo.setCurrentIndex(max(0, idx))
+        self.field_combo.setVisible(bool(fields))
+        self.field_combo.blockSignals(False)
+        self._fit_filter_row()
+        if current is not None and idx < 0:
+            self._emit_filters()  # the field filter in use no longer exists
+
     def clear_filters(self) -> None:
         self.search_input.clear()
         self.priority_combo.setCurrentIndex(0)
         self.label_combo.setCurrentIndex(0)
         self.due_combo.setCurrentIndex(0)
         self.status_combo.setCurrentIndex(0)
+        self.field_combo.setCurrentIndex(0)
         self._emit_filters()
 
     def _emit_filters(self) -> None:
@@ -206,5 +257,6 @@ class FilterBar(QFrame):
             "label_id": self.label_combo.currentData(),
             "due_filter": self.due_combo.currentData(),
             "is_completed": self.status_combo.currentData(),
+            "field_filter": self.field_combo.currentData(),
         }
         app_signals.filter_changed.emit(filters)

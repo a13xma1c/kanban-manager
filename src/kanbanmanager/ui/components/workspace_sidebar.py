@@ -7,6 +7,7 @@ from typing import Optional, List, Dict, Any
 
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
+    QMessageBox,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -35,6 +36,10 @@ class WorkspaceSidebar(QFrame):
     edit_board_requested = Signal(int)
     backup_manager_requested = Signal()
     demo_board_requested = Signal(int)  # workspace_id (0 = current/first)
+    focus_requested = Signal()
+    inbox_requested = Signal()
+    split_requested = Signal()
+    no_board_available = Signal()  # the open board is gone and no other board exists
 
     def __init__(self, service: Optional[DatabaseService] = None, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -69,6 +74,31 @@ class WorkspaceSidebar(QFrame):
 
         header_layout.addStretch()
         layout.addLayout(header_layout)
+
+        # ---------------------------------------------------------------------
+        # Cross-workspace pages: My Focus, Global Inbox, Split View
+        # ---------------------------------------------------------------------
+        nav = QVBoxLayout()
+        layout.addLayout(nav)
+        nav.setSpacing(2)
+        nav_style = (
+            "QPushButton { text-align: left; background: transparent; color: #CBD5E1; border: none;"
+            " border-radius: 6px; padding: 7px 10px; font-weight: 600; }"
+            "QPushButton:hover { background-color: #1E293B; }"
+            "QPushButton:checked { background-color: #1D4ED8; color: #FFFFFF; }"
+        )
+        self.focus_btn = QPushButton("🎯  My Focus")
+        self.focus_btn.setToolTip("Everything assigned to you, across all workspaces")
+        self.inbox_btn = QPushButton("📥  Inbox")
+        self.inbox_btn.setToolTip("Quick-captured items waiting to be sorted into boards")
+        self.split_btn = QPushButton("🗂  Split View")
+        self.split_btn.setToolTip("Several boards side by side; drag cards between them")
+        for btn, signal in ((self.focus_btn, self.focus_requested), (self.inbox_btn, self.inbox_requested),
+                            (self.split_btn, self.split_requested)):
+            btn.setCheckable(True)
+            btn.setStyleSheet(nav_style)
+            btn.clicked.connect(signal.emit)
+            nav.addWidget(btn)
 
         # ---------------------------------------------------------------------
         # Workspaces Header + Add Button
@@ -121,13 +151,44 @@ class WorkspaceSidebar(QFrame):
         demo_btn.clicked.connect(lambda: self.demo_board_requested.emit(self.current_workspace_id or 0))
         layout.addWidget(demo_btn)
 
-        backup_btn = QPushButton("💾 Backups & Data")
+        theme_btn = QPushButton("🎨 Appearance")
+        theme_btn.setToolTip("Themes, your own colours and text size")
+        theme_btn.setStyleSheet(
+            "QPushButton { text-align: left; background-color: #1E293B; color: #E2E8F0; padding: 8px 12px; border: 1px solid #334155; border-radius: 6px; font-weight: 600; } "
+            "QPushButton:hover { background-color: #334155; }"
+        )
+        theme_btn.clicked.connect(app_signals.appearance_requested.emit)
+        layout.addWidget(theme_btn)
+
+        io_btn = QPushButton("⇅ Import / Export")
+        io_btn.setToolTip("Spreadsheets, PDF reports, board pictures, calendars, Trello (Ctrl+Shift+E)")
+        io_btn.setStyleSheet(
+            "QPushButton { text-align: left; background-color: #1E293B; color: #E2E8F0; padding: 8px 12px; border: 1px solid #334155; border-radius: 6px; font-weight: 600; } "
+            "QPushButton:hover { background-color: #334155; }"
+        )
+        io_btn.clicked.connect(self._request_import_export)
+        layout.addWidget(io_btn)
+
+        backup_btn = QPushButton("💾 Backups && Data")  # "&&" = a literal ampersand (not a mnemonic)
         backup_btn.setStyleSheet(
             "QPushButton { text-align: left; background-color: #1E293B; color: #E2E8F0; padding: 8px 12px; border: 1px solid #334155; border-radius: 6px; font-weight: 600; } "
             "QPushButton:hover { background-color: #334155; }"
         )
         backup_btn.clicked.connect(self.backup_manager_requested.emit)
         layout.addWidget(backup_btn)
+
+    def _request_import_export(self, _checked: bool = False) -> None:
+        app_signals.import_export_requested.emit(self.current_board_id or 0)
+
+    def set_inbox_count(self, count: int) -> None:
+        self.inbox_btn.setText(f"📥  Inbox  ({count})" if count else "📥  Inbox")
+
+    def set_active_page(self, page: str) -> None:
+        """Highlight the active cross-workspace page ('focus', 'inbox', 'split') or none ('board')."""
+        for name, btn in (("focus", self.focus_btn), ("inbox", self.inbox_btn), ("split", self.split_btn)):
+            btn.setChecked(name == page)
+        if page != "board":
+            self.tree.clearSelection()
 
     def refresh(self) -> None:
         """Reload workspaces and boards into the tree widget."""
@@ -154,15 +215,23 @@ class WorkspaceSidebar(QFrame):
             self.tree.setCurrentItem(selected_item)
             if self.current_board_id:
                 app_signals.board_selected.emit(self.current_board_id)
-        elif self.tree.topLevelItemCount() > 0:
-            first_ws = self.tree.topLevelItem(0)
-            if first_ws.childCount() > 0:
-                first_board = first_ws.child(0)
+            return
+        # The remembered board is gone (deleted, restored away) or none was open yet: open the
+        # first board of any workspace - or tell the window there is nothing left to show
+        for i in range(self.tree.topLevelItemCount()):
+            ws_item = self.tree.topLevelItem(i)
+            if ws_item.childCount() > 0:
+                first_board = ws_item.child(0)
                 self.tree.setCurrentItem(first_board)
                 data = first_board.data(0, Qt.UserRole)
                 self.current_board_id = data["id"]
                 self.current_workspace_id = data["workspace_id"]
                 app_signals.board_selected.emit(self.current_board_id)
+                return
+        had_board = self.current_board_id is not None
+        self.current_board_id = None
+        if had_board:
+            self.no_board_available.emit()
 
     def select_board(self, board_id: int) -> None:
         """Programmatically select a board item in the tree."""
@@ -201,7 +270,7 @@ class WorkspaceSidebar(QFrame):
         menu = QMenu(self)
         if data["type"] == "workspace":
             ws_id = data["id"]
-            add_b_act = menu.addAction("➕ New Board in Workspace")
+            add_b_act = menu.addAction("➕ New Board in Workspace…")
             add_b_act.triggered.connect(lambda: self.new_board_requested.emit(ws_id))
 
             demo_act = menu.addAction("✨ Add Demo Board")
@@ -219,6 +288,15 @@ class WorkspaceSidebar(QFrame):
             b_id = data["id"]
             edit_b_act = menu.addAction("✏ Edit Board Settings")
             edit_b_act.triggered.connect(lambda: self.edit_board_requested.emit(b_id))
+            menu.addAction("🧩 Custom Fields...", lambda: app_signals.custom_fields_requested.emit(b_id))
+            menu.addAction("📋 Task Templates...", lambda: app_signals.task_templates_requested.emit(b_id))
+            menu.addAction("⚡ Automations...", lambda: app_signals.automations_requested.emit(b_id))
+            menu.addAction("🗄 Archived Tasks...", lambda: app_signals.archived_tasks_requested.emit(b_id))
+            menu.addAction("💾 Save as Board Template...",
+                           lambda: app_signals.board_template_save_requested.emit(b_id))
+            menu.addSeparator()
+            menu.addAction("⇅ Import / Export...", lambda: app_signals.import_export_requested.emit(b_id))
+            menu.addAction("📅 Calendar Sync...", lambda: app_signals.calendar_sync_requested.emit(b_id))
 
             menu.addSeparator()
 
@@ -227,10 +305,36 @@ class WorkspaceSidebar(QFrame):
 
         menu.exec(self.tree.mapToGlobal(pos))
 
-    def _delete_workspace(self, workspace_id: int) -> None:
+    def _confirm_delete(self, title: str, what: str) -> bool:
+        return QMessageBox.question(
+            self, title, f"{what}\n\nThis can't be undone (except by restoring a backup).",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+
+    @staticmethod
+    def _count(n: int, noun: str) -> str:
+        return f"{n} {noun}{'' if n == 1 else 's'}"
+
+    def _delete_workspace(self, workspace_id: int) -> bool:
+        ws = self.service.get_workspace(workspace_id)
+        if ws is None:
+            return False
+        board_ids = [b.id for b in ws.boards]
+        tasks = self.service.count_tasks(board_ids)
+        if not self._confirm_delete("Delete Workspace", f"Delete the workspace '{ws.name}' with its "
+                                    f"{self._count(len(board_ids), 'board')} and {self._count(tasks, 'task')}?"):
+            return False
         self.service.delete_workspace(workspace_id)
         self.refresh()
+        return True
 
-    def _delete_board(self, board_id: int) -> None:
+    def _delete_board(self, board_id: int) -> bool:
+        board = self.service.get_board(board_id)
+        if board is None:
+            return False
+        tasks = self.service.count_tasks([board_id])
+        if not self._confirm_delete("Delete Board",
+                                    f"Delete the board '{board.name}' and its {self._count(tasks, 'task')}?"):
+            return False
         self.service.delete_board(board_id)
         self.refresh()
+        return True

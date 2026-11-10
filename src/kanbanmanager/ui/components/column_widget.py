@@ -3,7 +3,9 @@ Kanban Column Widget with Drag-and-Drop Drop Target and WIP Limit Enforcement
 """
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, List
+from datetime import date
+from functools import partial
+from typing import Optional, Dict, Any, List, Tuple
 
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QColor, QPainter, QPen
@@ -19,8 +21,17 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 
+from kanbanmanager.core import custom_fields as cf
 from kanbanmanager.core.signals import app_signals
 from kanbanmanager.ui.components.task_card import TaskCardWidget, MIME_TASK_ID
+
+
+_NOT_SHOWN = frozenset({"position", "updated_at"})  # task keys a card doesn't display
+
+
+def card_day() -> int:
+    """Cards word their due dates relative to today, so a new day means new cards."""
+    return date.today().toordinal()
 
 
 class DropAreaWidget(QWidget):
@@ -124,14 +135,23 @@ class KanbanColumnWidget(QFrame):
     column_edit_requested = Signal(int)  # column_id
     column_delete_requested = Signal(int)  # column_id
 
-    def __init__(self, column_data: Dict[str, Any], parent: Optional[QWidget] = None):
+    def __init__(self, column_data: Dict[str, Any], parent: Optional[QWidget] = None, width: int = 310,
+                 fields: Optional[List[Dict[str, Any]]] = None, templates: Optional[List[Dict[str, Any]]] = None):
+        """``fields``: the board's custom fields (card chips, header totals);
+        ``templates``: task templates offered in the column menu."""
         super().__init__(parent)
         self.column_data = column_data
         self.column_id = column_data.get("id", 0)
         self.board_id = column_data.get("board_id", 0)
+        self.task_ids: List[int] = []
+        self.fields = fields or []
+        self.templates = templates or []
+        # Card widgets by task id, with the data they were built from: refreshing the board
+        # reuses every card whose task didn't change instead of rebuilding all of them
+        self._cards: Dict[int, Tuple[Any, TaskCardWidget]] = {}
 
         self.setObjectName("ColumnContainer")
-        self.setFixedWidth(310)
+        self.setFixedWidth(width)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
 
         self._init_ui()
@@ -176,6 +196,7 @@ class KanbanColumnWidget(QFrame):
         add_btn = QPushButton("+")
         add_btn.setFixedSize(24, 24)
         add_btn.setToolTip("Add task to this column")
+        add_btn.setAccessibleName(f"Add task to {self.column_data.get('name', 'column')}")
         add_btn.setStyleSheet(
             "QPushButton { background-color: #334155; color: #F8FAFC; border-radius: 4px; font-weight: bold; border: none; } "
             "QPushButton:hover { background-color: #3B82F6; }"
@@ -187,6 +208,7 @@ class KanbanColumnWidget(QFrame):
         opt_btn = QPushButton("⋮")
         opt_btn.setFixedSize(24, 24)
         opt_btn.setToolTip("Column settings")
+        opt_btn.setAccessibleName(f"Menu for column {self.column_data.get('name', '')}")
         opt_btn.setStyleSheet(
             "QPushButton { background-color: transparent; color: #94A3B8; border: none; font-size: 16px; border-radius: 4px; } "
             "QPushButton:hover { background-color: #334155; color: #F8FAFC; }"
@@ -195,6 +217,14 @@ class KanbanColumnWidget(QFrame):
         header_layout.addWidget(opt_btn)
 
         main_layout.addWidget(header_frame)
+
+        # Totals of numeric custom fields ("Σ 13 pts"), shown under the header when any
+        self.totals_lbl = QLabel("")
+        self.totals_lbl.setObjectName("ColumnTotals")
+        self.totals_lbl.setStyleSheet("#ColumnTotals { background: transparent; color: #94A3B8; font-size: 11px;"
+                                      " font-weight: 600; padding: 0 12px 6px 14px; }")
+        self.totals_lbl.setVisible(False)
+        main_layout.addWidget(self.totals_lbl)
 
         # ---------------------------------------------------------------------
         # Scrollable Cards Area
@@ -215,7 +245,7 @@ class KanbanColumnWidget(QFrame):
             text = f"{count}/{wip_limit}"
             if count >= wip_limit:
                 style = (
-                    "background-color: #EF444422; color: #EF4444; border: 1px solid #EF444466; "
+                    "background-color: rgba(239, 68, 68, 34); color: #EF4444; border: 1px solid rgba(239, 68, 68, 102); "
                     "border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: bold;"
                 )
             else:
@@ -233,30 +263,107 @@ class KanbanColumnWidget(QFrame):
         self.count_badge.setText(text)
         self.count_badge.setStyleSheet(style)
 
-    def set_tasks(self, tasks: List[Dict[str, Any]]) -> None:
-        """Populate column with task cards."""
-        # Clear existing card widgets
-        while self.drop_area.cards_layout.count() > 1:
-            item = self.drop_area.cards_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+    def set_tasks(self, tasks: List[Dict[str, Any]], keep_hidden: bool = False) -> None:
+        """Show these tasks' cards, in this order. Cards of unchanged tasks are reused.
+        ``keep_hidden``: cards of tasks not listed are hidden rather than destroyed (the board
+        is filtered, so they'll very likely be back)."""
+        layout = self.drop_area.cards_layout
+        while layout.count() > 1:  # detach the cards; the trailing stretch stays
+            layout.takeAt(0)
+
+        day = card_day()
+        wanted: List[TaskCardWidget] = []
+        for t in tasks:
+            # Everything the card shows. Not its position or timestamp: moving one card
+            # renumbers its neighbours, which needn't rebuild them.
+            signature = (day, {k: v for k, v in t.items() if k not in _NOT_SHOWN})
+            entry = self._cards.get(t.get("id"))
+            if entry is not None and entry[0] == signature:
+                card = entry[1]
+                card.task_data = t
+            else:
+                if entry is not None:
+                    self._discard(entry[1])
+                card = TaskCardWidget(t, self.drop_area, fields=self.fields)
+                self._cards[t.get("id")] = (signature, card)
+            wanted.append(card)
+
+        listed = {t.get("id") for t in tasks}
+        for task_id, (_sig, card) in list(self._cards.items()):
+            if task_id not in listed:
+                if keep_hidden:
+                    card.hide()
+                else:
+                    self._discard(card)
+                    del self._cards[task_id]
+
+        # Showing many cards one by one relayouts the column for each; hide the container
+        # while doing it and the column is laid out once
+        reveal = [card for card in wanted if card.isHidden()]
+        batch = len(reveal) > 8 and self.drop_area.isVisible()
+        if batch:
+            self.drop_area.setUpdatesEnabled(False)
+            self.drop_area.hide()
+        for index, card in enumerate(wanted):
+            layout.insertWidget(index, card)
+        for card in reveal:
+            card.show()
+        if batch:
+            self.drop_area.show()
+            self.drop_area.setUpdatesEnabled(True)
 
         wip_limit = self.column_data.get("wip_limit", 0)
+        self.column_data["task_count"] = len(tasks)
         self._update_count_badge(len(tasks), wip_limit)
+        self.task_ids = [t.get("id") for t in tasks]
+        self._update_totals(tasks)
 
-        for t in tasks:
-            card = TaskCardWidget(t, self.drop_area)
-            self.drop_area.cards_layout.insertWidget(self.drop_area.cards_layout.count() - 1, card)
+    @staticmethod
+    def _discard(card: TaskCardWidget) -> None:
+        card.hide()
+        card.deleteLater()
+
+    def _update_totals(self, tasks: List[Dict[str, Any]]) -> None:
+        parts, tips = [], []
+        for f in self.fields:
+            total = cf.column_total(f, [(t.get("field_values") or {}).get(f["id"]) for t in tasks])
+            if total is not None:
+                parts.append(total)
+                tips.append(f"{f['name']}: {total}")
+        self.totals_lbl.setText("Σ " + "  ·  ".join(parts) if parts else "")
+        self.totals_lbl.setToolTip("Totals in this column\n" + "\n".join(tips) if tips else "")
+        self.totals_lbl.setVisible(bool(parts))
+
+    def cards(self) -> List[TaskCardWidget]:
+        lay = self.drop_area.cards_layout
+        return [lay.itemAt(i).widget() for i in range(lay.count())
+                if isinstance(lay.itemAt(i).widget(), TaskCardWidget)]
 
     def request_task_move(self, task_id: int, target_position: int) -> None:
-        """Called when a card is dropped into this column."""
-        app_signals.task_moved.emit(task_id, self.column_id)
+        """Called when a card is dropped into this column (from this board or another one)."""
+        if task_id in self.task_ids and self.task_ids.index(task_id) < target_position:
+            target_position -= 1  # the card itself is counted above its drop position
+        app_signals.task_dropped.emit(task_id, self.column_id, target_position)
+
+    def request_from_template(self, template_id: int, _checked: bool = False) -> None:
+        app_signals.task_from_template_requested.emit(self.board_id, self.column_id, template_id)
+
+    def _manage_templates(self, _checked: bool = False) -> None:
+        app_signals.task_templates_requested.emit(self.board_id)
 
     def _show_column_menu(self) -> None:
         menu = QMenu(self)
         
         add_act = menu.addAction("➕ Add Task")
         add_act.triggered.connect(lambda: self.task_add_requested.emit(self.column_id))
+        tpl_menu = menu.addMenu("📋 New from Template")
+        for t in self.templates:
+            act = tpl_menu.addAction(f"{t['icon']}  {t['name']}".replace("&", "&&"))
+            act.triggered.connect(partial(self.request_from_template, t["id"]))
+        if not self.templates:
+            tpl_menu.addAction("No templates yet").setEnabled(False)
+        tpl_menu.addSeparator()
+        tpl_menu.addAction("Manage Templates…").triggered.connect(self._manage_templates)
 
         edit_act = menu.addAction("✏ Edit Column (WIP & Workflow)")
         edit_act.triggered.connect(lambda: self.column_edit_requested.emit(self.column_id))

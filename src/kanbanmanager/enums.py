@@ -80,16 +80,35 @@ class RecurrenceFrequency(str, Enum):
 
 class DependencyType(str, Enum):
     FINISH_TO_START = "FINISH_TO_START"  # Prerequisite must be done before dependent can start
-    BLOCKS = "BLOCKS"                    # Task blocks another task
-    BLOCKED_BY = "BLOCKED_BY"            # Task is blocked by another task
+    START_TO_START = "START_TO_START"    # Dependent can start once the prerequisite has started
+    FINISH_TO_FINISH = "FINISH_TO_FINISH"  # Dependent can finish once the prerequisite has finished
+    START_TO_FINISH = "START_TO_FINISH"  # Dependent can finish once the prerequisite has started
+    BLOCKS = "BLOCKS"                    # Legacy alias of finish-to-start
+    BLOCKED_BY = "BLOCKED_BY"            # Legacy alias of finish-to-start
 
     @property
     def display_name(self) -> str:
         return {
             DependencyType.FINISH_TO_START: "Finish to Start",
+            DependencyType.START_TO_START: "Start to Start",
+            DependencyType.FINISH_TO_FINISH: "Finish to Finish",
+            DependencyType.START_TO_FINISH: "Start to Finish",
             DependencyType.BLOCKS: "Blocks",
             DependencyType.BLOCKED_BY: "Blocked by",
         }[self]
+
+    @property
+    def short(self) -> str:
+        return {
+            DependencyType.START_TO_START: "SS",
+            DependencyType.FINISH_TO_FINISH: "FF",
+            DependencyType.START_TO_FINISH: "SF",
+        }.get(self, "FS")
+
+    @property
+    def scheduling_type(self) -> "DependencyType":
+        """The legacy 'blocks' types schedule like finish-to-start."""
+        return DependencyType.FINISH_TO_START if self in (DependencyType.BLOCKS, DependencyType.BLOCKED_BY) else self
 
 
 class ViewMode(str, Enum):
@@ -130,9 +149,14 @@ class ActivityAction(str, Enum):
     DEPENDENCY_ADDED = "DEPENDENCY_ADDED"
     DEPENDENCY_REMOVED = "DEPENDENCY_REMOVED"
     REMINDER_SET = "REMINDER_SET"
+    TASK_ARCHIVED = "TASK_ARCHIVED"
+    TASK_RESTORED = "TASK_RESTORED"
+    DEPENDENCY_UPDATED = "DEPENDENCY_UPDATED"
+    BASELINE_SAVED = "BASELINE_SAVED"
     TIME_LOGGED = "TIME_LOGGED"
     TIME_ENTRY_UPDATED = "TIME_ENTRY_UPDATED"
     TIME_ENTRY_DELETED = "TIME_ENTRY_DELETED"
+    BOARD_UPDATED = "BOARD_UPDATED"   # board structure: custom fields, templates
 
     @property
     def is_comment_action(self) -> bool:

@@ -7,7 +7,6 @@ import base64
 import binascii
 import json
 import os
-import shutil
 import sqlite3
 from contextlib import nullcontext
 from datetime import datetime, timedelta
@@ -16,6 +15,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from kanbanmanager.config import DEFAULT_DB_PATH, DEFAULT_BACKUP_DIR
 from kanbanmanager.core.markdown_utils import rewrite_attachment_refs
+from kanbanmanager.core.automation import local_policies, local_rule, portable_policies, portable_rule
 from kanbanmanager.database.attachments import AttachmentError, AttachmentStore
 from kanbanmanager.database.connection import get_db_manager, DatabaseManager
 from kanbanmanager.database.models import (
@@ -31,12 +31,23 @@ from kanbanmanager.database.models import (
     Attachment,
     TimeEntry,
     TeamMember,
+    ProjectBaseline,
+    BaselineEntry,
+    InboxItem,
+    TaskTemplate,
+    BoardTemplate,
     utc_now,
 )
+from kanbanmanager.core import custom_fields as cf
 from kanbanmanager.database.service import DatabaseService
 
-# 1.1 adds comments, attachments and per-task history; 1.2 adds assignees, time entries, team capacity
-EXPORT_FORMAT_VERSION = "1.2"
+# 1.1 adds comments, attachments and per-task history; 1.2 adds assignees, time entries, team capacity;
+# 1.3 adds automation rules, board policies and archived tasks;
+# 1.4 adds dependency lag/types, milestones, locked dates, schedule settings and baselines;
+# 1.5 adds the global Inbox (quick-captured items);
+# 1.6 adds typed custom fields (definitions per board, values by field name), task templates
+#     (per board and global) and saved board templates
+EXPORT_FORMAT_VERSION = "1.6"
 ATTACHMENT_MIRROR_DIRNAME = "attachments"
 
 
@@ -136,25 +147,53 @@ class BackupManager:
             )
         return results
 
+    REQUIRED_TABLES = frozenset({"workspaces", "boards", "board_columns", "tasks"})
+
+    def validate_backup(self, backup_path: Path | str) -> None:
+        """Raise ValueError unless the file is an intact KanbanManager database."""
+        src = Path(backup_path)
+        tables: set = set()
+        ok = False
+        try:
+            con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+            try:
+                ok = con.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+                tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            finally:
+                con.close()
+        except sqlite3.DatabaseError:
+            ok = False
+        if not ok or not self.REQUIRED_TABLES <= tables:
+            raise ValueError(f"'{src.name}' is not a KanbanManager backup (or it is damaged)")
+
     def restore_database_backup(self, backup_path: Path | str) -> bool:
-        """Restore database from a SQLite backup file safely."""
+        """Replace the live database with a snapshot.
+
+        The snapshot is checked first, the current data is saved as a safety snapshot, and
+        the pages are copied *into* the live database with SQLite's backup API - which, unlike
+        copying files, is correct in WAL mode (recent commits live in the -wal file) and with
+        other connections open. Raises FileNotFoundError / ValueError and changes nothing
+        when the file can't be used."""
         src = Path(backup_path)
         if not src.exists():
             raise FileNotFoundError(f"Backup file not found at {src}")
+        self.validate_backup(src)
 
-        # Safety: create pre-restore snapshot of current database
+        # Safety: snapshot the current data first (through SQLite, so nothing in the WAL is
+        # missed). If that fails, don't restore: the user could lose their current work.
         if self.db.db_path.exists():
-            safety_dest = self.backup_dir / f"pre_restore_safety_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-            try:
-                shutil.copy2(self.db.db_path, safety_dest)
-            except Exception:
-                pass
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            self.create_database_backup(self.backup_dir / f"pre_restore_safety_{stamp}.db")
 
-        # Dispose current engine connections
         self.db.engine.dispose()
-
-        # Copy backup file over live db file
-        shutil.copy2(src, self.db.db_path)
+        src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+        dst_conn = sqlite3.connect(str(self.db.db_path))
+        try:
+            src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+            src_conn.close()
+        self.db.engine.dispose()  # no pooled connection may keep pages from before
 
         # Re-initialize database schema/engine (also migrates snapshots from older versions)
         self.db.init_database(seed_defaults=False)
@@ -183,6 +222,22 @@ class BackupManager:
         }
 
         with self.db.session_scope() as session:
+            board_names = {b.id: b.name for b in session.query(Board)}
+            data["inbox"] = []
+            for item in session.query(InboxItem).order_by(InboxItem.created_at):
+                entry = item.to_dict()
+                entry.pop("id", None)
+                entry["board_hint"] = board_names.get(entry.pop("board_hint_id"))
+                data["inbox"].append(entry)
+            data["task_templates"] = [
+                {"name": t.name, "icon": t.icon, "data": t.data}
+                for t in session.query(TaskTemplate).filter(TaskTemplate.board_id.is_(None))
+                .order_by(TaskTemplate.position, TaskTemplate.id)
+            ]
+            data["board_templates"] = [
+                {k: v for k, v in t.to_dict().items() if k not in ("id", "builtin", "created_at")}
+                for t in session.query(BoardTemplate).order_by(BoardTemplate.name)
+            ]
             data["team_members"] = [m.to_dict() for m in session.query(TeamMember).order_by(TeamMember.name)]
             for m in data["team_members"]:
                 m.pop("id", None)
@@ -210,6 +265,17 @@ class BackupManager:
                         "labels": [],
                         "tasks": [],
                         "dependencies": [],
+                        "automation_rules": [],
+                        "policies": {},
+                        "custom_fields": [
+                            {k: v for k, v in f.to_dict().items()
+                             if k in ("name", "field_type", "config", "description", "required", "default",
+                                      "show_on_card")}
+                            for f in board.custom_fields
+                        ],
+                        "task_templates": [
+                            {"name": t.name, "icon": t.icon, "data": t.data} for t in board.task_templates
+                        ],
                     }
                     col_id_map = {}
                     for col in board.columns:
@@ -254,6 +320,11 @@ class BackupManager:
                                 "recurrence_rule": task.recurrence_rule,
                                 "labels": [lbl.name for lbl in task.labels],
                                 "assignee": task.assignee,
+                                "is_archived": bool(task.is_archived),
+                                "is_milestone": bool(task.is_milestone),
+                                "dates_locked": bool(task.dates_locked),
+                                "archived_at": task.archived_at.isoformat() if task.archived_at else None,
+                                "archive_reason": task.archive_reason,
                                 "time_entries": [
                                     {
                                         "user": e.user,
@@ -306,8 +377,42 @@ class BackupManager:
                                 "task_id": d.task_id,
                                 "depends_on_task_id": d.depends_on_task_id,
                                 "dependency_type": d.dependency_type,
+                                "lag_days": int(d.lag_days or 0),
                             }
                         )
+
+                    col_names = {c.id: c.name for c in board.columns}
+                    label_names = {l.id: l.name for l in board.labels}
+                    field_names = {f.id: f.name for f in board.custom_fields}
+                    template_names = {t.id: t.name for t in board.task_templates}
+                    board_data["automation_rules"] = [
+                        portable_rule(r.to_dict(), col_names, label_names, field_names, template_names)
+                        for r in board.automation_rules
+                    ]
+                    board_data["policies"] = portable_policies(board.policies, col_names)
+                    schedule = dict(board.schedule_settings)
+                    shown = schedule.pop("baseline_id", None)
+                    board_data["schedule_settings"] = schedule
+                    board_data["baselines"] = [
+                        {
+                            "name": bl.name,
+                            "created_by": bl.created_by,
+                            "created_at": bl.created_at.isoformat() if bl.created_at else None,
+                            "shown": bl.id == shown,
+                            "entries": [
+                                {
+                                    "task_temp_id": e.task_id,
+                                    "title": e.title,
+                                    "start_date": e.start_date.isoformat(),
+                                    "finish_date": e.finish_date.isoformat(),
+                                    "duration_days": e.duration_days,
+                                    "is_milestone": bool(e.is_milestone),
+                                }
+                                for e in bl.entries
+                            ],
+                        }
+                        for bl in board.baselines
+                    ]
 
                     ws_data["boards"].append(board_data)
                 data["workspaces"].append(ws_data)
@@ -375,6 +480,8 @@ class BackupManager:
                 )
 
             for b_data in ws_data.get("boards", []):
+                # Labels come from the file (not the default palette on top of them, which
+                # duplicated every default label on import)
                 board = service.create_board(
                     workspace_id=ws.id,
                     name=b_data.get("name", "Imported Board"),
@@ -382,17 +489,14 @@ class BackupManager:
                     color=b_data.get("color", "#3B82F6"),
                     icon=b_data.get("icon", "layout"),
                     columns_def=b_data.get("columns"),
+                    labels_def=b_data.get("labels") if "labels" in b_data else None,
                 )
 
                 # Re-fetch created columns
                 cols = service.get_columns_for_board(board.id)
                 col_by_name = {c.name: c for c in cols}
-
-                # Create labels
-                created_labels = {}
-                for l_data in b_data.get("labels", []):
-                    lbl = service.create_label(board.id, l_data["name"], l_data.get("color", "#3B82F6"))
-                    created_labels[lbl.name] = lbl
+                created_labels = {lbl.name: lbl for lbl in service.get_labels_for_board(board.id)}
+                fields = self._import_fields(service, board.id, b_data.get("custom_fields") or [])
 
                 # Create tasks & map temp IDs
                 id_map: Dict[int, int] = {}
@@ -431,10 +535,12 @@ class BackupManager:
                             due_date=due_d,
                             label_ids=lbl_ids,
                             checklist=t_data.get("checklist", []),
-                            custom_fields=t_data.get("custom_fields", {}),
+                            **self._import_field_values(fields, t_data.get("custom_fields") or {}),
                             is_recurring=bool(t_data.get("is_recurring", False)),
                             recurrence_rule=t_data.get("recurrence_rule", {}),
                             assignee=t_data.get("assignee"),
+                            is_milestone=bool(t_data.get("is_milestone")),
+                            dates_locked=bool(t_data.get("dates_locked")),
                         )
 
                         if t_data.get("is_completed"):
@@ -442,16 +548,115 @@ class BackupManager:
 
                         self._import_rich_content(service, board.id, new_task.id, t_data)
 
+                    if t_data.get("is_archived"):
+                        with service.activity_paused():
+                            service.archive_task(new_task.id, reason=t_data.get("archive_reason"))
+                        archived_at = _parse_dt(t_data.get("archived_at"))
+                        if archived_at:
+                            with self.db.session_scope() as session:
+                                session.get(Task, new_task.id).archived_at = archived_at
+
                     old_id = t_data.get("temp_id")
                     if old_id:
                         id_map[old_id] = new_task.id
+
+                for tt in b_data.get("task_templates") or []:
+                    try:
+                        service.save_task_template(tt.get("name"), tt.get("data") or {}, board_id=board.id,
+                                                   icon=tt.get("icon") or "📋")
+                    except ValueError:
+                        continue
+
+                # Automation (by column/label/field/template name; references to missing ones stay
+                # empty and show as problems)
+                label_ids = {l.name: l.id for l in service.get_labels_for_board(board.id)}
+                column_ids = {c.name: c.id for c in cols}
+                field_ids = {f["name"]: f["id"] for f in service.get_custom_fields(board.id)}
+                template_ids = {t["name"]: t["id"] for t in service.get_task_templates(board.id, include_global=False)}
+                for r_data in b_data.get("automation_rules", []) or []:
+                    try:
+                        service.save_automation_rule(board.id, local_rule(r_data, column_ids, label_ids, field_ids,
+                                                                          template_ids))
+                    except ValueError:
+                        continue
+                if b_data.get("policies"):
+                    service.set_board_policies(board.id, local_policies(b_data["policies"], column_ids))
 
                 # Recreate dependencies (already present in replayed history, if exported)
                 replayed = any("activity" in t for t in b_data.get("tasks", []))
                 with service.activity_paused() if replayed else nullcontext():
                     self._import_dependencies(service, b_data, id_map)
+                self._import_schedule(service, board.id, b_data, id_map)
 
+        self._import_inbox(service, data.get("inbox") or [])
+        self._import_templates(service, data)
         return True
+
+    @staticmethod
+    def _import_fields(service: DatabaseService, board_id: int, defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Custom field definitions of an imported board (invalid or unknown-type ones are skipped)."""
+        with service.activity_paused():
+            for f in defs:
+                if not cf.is_known_type(f.get("field_type") or ""):
+                    continue
+                try:
+                    service.create_custom_field(board_id, f.get("name"), f.get("field_type"), config=f.get("config"),
+                                                required=bool(f.get("required")), default=f.get("default"),
+                                                show_on_card=bool(f.get("show_on_card", True)),
+                                                description=f.get("description") or "")
+                except (cf.FieldValueError, ValueError):
+                    continue
+        return service.get_custom_fields(board_id)
+
+    @staticmethod
+    def _import_field_values(fields: List[Dict[str, Any]], values: Dict[str, Any]) -> Dict[str, Any]:
+        """create_task() arguments for a task's exported values: the board's fields get exactly
+        their exported value (no defaults), values that don't fit are dropped, and names without
+        a definition (files from before 1.6) become fields of their own."""
+        by_name = {f["name"].lower(): f for f in fields}
+        given = {str(k).lower(): v for k, v in values.items()}
+        field_values: Dict[int, Any] = {}
+        for f in fields:
+            try:
+                field_values[f["id"]] = cf.validate_value(f, given.get(f["name"].lower()))
+            except cf.FieldValueError:
+                field_values[f["id"]] = None
+        legacy = {k: v for k, v in values.items() if str(k).lower() not in by_name}
+        return {"field_values": field_values, "custom_fields": legacy}
+
+    @staticmethod
+    def _import_templates(service: DatabaseService, data: Dict[str, Any]) -> None:
+        for tt in data.get("task_templates") or []:
+            try:
+                service.save_task_template(tt.get("name"), tt.get("data") or {}, icon=tt.get("icon") or "📋")
+            except ValueError:
+                continue  # a global template of that name exists already
+        existing = {t["name"].lower() for t in service.get_board_templates() if not t.get("builtin")}
+        for bt in data.get("board_templates") or []:
+            name = (bt.get("name") or "").strip()
+            if not name or name.lower() in existing:
+                continue
+            try:
+                service.save_board_template(name, bt.get("data") or {}, description=bt.get("description") or "",
+                                            icon=bt.get("icon") or "📋", color=bt.get("color") or "#3B82F6",
+                                            category=bt.get("category") or "My templates")
+            except ValueError:
+                continue
+
+    def _import_inbox(self, service: DatabaseService, items: List[Dict[str, Any]]) -> None:
+        boards = {b.name: b.id for ws in service.get_workspaces() for b in ws.boards}
+        with self.db.session_scope() as session:
+            for e in items:
+                if not (e.get("title") or "").strip():
+                    continue
+                item = InboxItem(title=e["title"][:255], raw_text=e.get("raw_text") or e["title"],
+                                 notes=e.get("notes") or None, priority=e.get("priority"),
+                                 due_date=_parse_dt(e.get("due_date")), assignee=e.get("assignee") or None,
+                                 board_hint_id=boards.get(e.get("board_hint")), source=e.get("source") or "import",
+                                 captured_by=e.get("captured_by") or None,
+                                 created_at=_parse_dt(e.get("created_at")) or utc_now())
+                item.labels = e.get("labels") or []
+                session.add(item)
 
     @staticmethod
     def _import_dependencies(service: DatabaseService, b_data: Dict[str, Any], id_map: Dict[int, int]) -> None:
@@ -463,7 +668,35 @@ class BackupManager:
                     task_id=id_map[old_t_id],
                     depends_on_task_id=id_map[old_dep_on_id],
                     dependency_type=dep_data.get("dependency_type", "FINISH_TO_START"),
+                    lag_days=int(dep_data.get("lag_days") or 0),
                 )
+
+    def _import_schedule(self, service: DatabaseService, board_id: int, b_data: Dict[str, Any],
+                         id_map: Dict[int, int]) -> None:
+        """Schedule settings and baselines (task references re-linked to the imported tasks)."""
+        settings = dict(b_data.get("schedule_settings") or {})
+        with self.db.session_scope() as session:
+            for bl_data in b_data.get("baselines", []) or []:
+                baseline = ProjectBaseline(board_id=board_id, name=bl_data.get("name") or "Baseline",
+                                           created_by=bl_data.get("created_by"),
+                                           created_at=_parse_dt(bl_data.get("created_at")) or utc_now())
+                session.add(baseline)
+                session.flush()
+                for e in bl_data.get("entries", []) or []:
+                    try:
+                        start = datetime.fromisoformat(e["start_date"]).date()
+                        finish = datetime.fromisoformat(e["finish_date"]).date()
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    session.add(BaselineEntry(
+                        baseline_id=baseline.id, task_id=id_map.get(e.get("task_temp_id")),
+                        title=e.get("title") or "", start_date=start, finish_date=finish,
+                        duration_days=int(e.get("duration_days") or 0), is_milestone=bool(e.get("is_milestone")),
+                    ))
+                if bl_data.get("shown"):
+                    settings["baseline_id"] = baseline.id
+        if settings:
+            service.set_schedule_settings(board_id, settings)
 
     def _import_rich_content(self, service: DatabaseService, board_id: int, task_id: int, t_data: Dict[str, Any]) -> None:
         """Recreate comments, attachments and history for an imported task (format >= 1.1)."""

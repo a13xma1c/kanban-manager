@@ -48,6 +48,7 @@ from kanbanmanager.core.workload import (
 )
 from kanbanmanager.database.service import DatabaseService
 from kanbanmanager.timefmt import format_hours
+from kanbanmanager.ui.styles import CHECKBOX_QSS
 
 STATUS_COLORS = {
     "idle": "#334155",
@@ -145,6 +146,7 @@ class TeamDialog(QDialog):
         super().__init__(parent)
         self.service = service
         self.setWindowTitle("Team & Capacity")
+        self.setStyleSheet(CHECKBOX_QSS)
         self.resize(640, 380)
         layout = QVBoxLayout(self)
         info = QLabel("Weekly capacity is spread evenly over each person's working days. "
@@ -263,6 +265,7 @@ class WorkloadView(QWidget):
         layout.addLayout(title_row)
 
         header = QHBoxLayout()
+        layout.addLayout(header)  # attach first: a parentless layout + self-capturing lambda double-frees in PySide6
         self.scope_combo = QComboBox()
         self.scope_combo.addItem("This board", SCOPE_BOARD)
         self.scope_combo.addItem("Whole workspace", SCOPE_WORKSPACE)
@@ -287,7 +290,6 @@ class WorkloadView(QWidget):
         self.range_lbl.setStyleSheet("color: #94A3B8;")
         header.addWidget(self.range_lbl)
         header.addStretch()
-        layout.addLayout(header)
 
         self.summary_lbl = QLabel("")
         self.summary_lbl.setTextFormat(Qt.RichText)
@@ -303,7 +305,7 @@ class WorkloadView(QWidget):
         self.grid.verticalHeader().setVisible(False)
         self.grid.setShowGrid(True)
         self.grid.setStyleSheet("QTableWidget { gridline-color: #334155; }"
-                                "QTableWidget::item:selected { background-color: #1D4ED855; }")
+                                "QTableWidget::item:selected { background-color: rgba(29, 78, 216, 85); }")
         self.grid.cellClicked.connect(self._on_cell_clicked)
         self.grid.cellDoubleClicked.connect(self._on_cell_double_clicked)
         splitter.addWidget(self.grid)

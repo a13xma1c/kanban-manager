@@ -41,6 +41,7 @@ class RecurrenceEngine:
 
         # Check end criteria
         end_type = rule.get("end_type", "never")
+        end_day: Optional[date] = None
         if end_type == "after_count":
             max_count = int(rule.get("max_occurrences", 0))
             current_count = int(rule.get("occurrences_count", 0))
@@ -48,12 +49,12 @@ class RecurrenceEngine:
                 return None
         elif end_type == "end_date" and rule.get("end_date"):
             try:
-                end_dt = datetime.fromisoformat(rule["end_date"])
-                if from_dt >= end_dt:
-                    return None
-            except Exception:
-                pass
+                end_day = date.fromisoformat(str(rule["end_date"])[:10])
+            except ValueError:
+                end_day = None
 
+        # Monthly rules keep their day of the month: the 31st falls on Feb 28, then Mar 31 again
+        anchor_day = int(rule.get("month_day") or base_datetime.day)
         next_dt = base_datetime
 
         if freq == RecurrenceFrequency.DAILY.value:
@@ -68,31 +69,12 @@ class RecurrenceEngine:
 
         elif freq == RecurrenceFrequency.WEEKLY.value or freq == RecurrenceFrequency.BIWEEKLY.value:
             week_interval = 2 if freq == RecurrenceFrequency.BIWEEKLY.value else interval
-            days = rule.get("days_of_week")
-            if not days or not isinstance(days, list):
-                days = [base_datetime.weekday()]
-
-            # Sort days
-            days = sorted(list(set(days)))
-            found = False
-            candidate = base_datetime + timedelta(days=1)
-            
-            # Search within next 52 weeks
-            for _ in range(365):
-                if candidate.weekday() in days and candidate > from_dt:
-                    next_dt = candidate
-                    found = True
-                    break
-                candidate += timedelta(days=1)
-
-            if not found:
-                next_dt = base_datetime + timedelta(weeks=week_interval)
+            next_dt = RecurrenceEngine._next_weekly(base_datetime, rule.get("days_of_week"), week_interval, from_dt)
 
         elif freq == RecurrenceFrequency.MONTHLY.value:
-            # Advance month by interval
-            next_dt = RecurrenceEngine._add_months(base_datetime, interval)
+            next_dt = RecurrenceEngine._add_months(base_datetime, interval, anchor_day)
             while next_dt <= from_dt:
-                next_dt = RecurrenceEngine._add_months(next_dt, interval)
+                next_dt = RecurrenceEngine._add_months(next_dt, interval, anchor_day)
 
         elif freq == RecurrenceFrequency.CUSTOM.value:
             unit = rule.get("custom_unit", "days")  # "days", "weeks", "months"
@@ -101,22 +83,45 @@ class RecurrenceEngine:
                 while next_dt <= from_dt:
                     next_dt += timedelta(weeks=interval)
             elif unit == "months":
-                next_dt = RecurrenceEngine._add_months(base_datetime, interval)
+                next_dt = RecurrenceEngine._add_months(base_datetime, interval, anchor_day)
                 while next_dt <= from_dt:
-                    next_dt = RecurrenceEngine._add_months(next_dt, interval)
+                    next_dt = RecurrenceEngine._add_months(next_dt, interval, anchor_day)
             else:  # days
                 next_dt = base_datetime + timedelta(days=interval)
                 while next_dt <= from_dt:
                     next_dt += timedelta(days=interval)
 
+        if end_day is not None and next_dt.date() > end_day:
+            return None  # the series is over: the next occurrence would fall after its end date
         return next_dt
 
     @staticmethod
-    def _add_months(source_date: datetime, months: int) -> datetime:
+    def _next_weekly(base: datetime, days_of_week: Any, every_weeks: int, after: datetime) -> datetime:
+        """The first selected weekday after ``base`` (and after ``after``) in a week that is a
+        whole number of ``every_weeks`` weeks from ``base``'s week."""
+        days = sorted({int(d) for d in days_of_week if 0 <= int(d) <= 6}) if isinstance(days_of_week, list) else []
+        days = days or [base.weekday()]
+        base_monday = base.date() - timedelta(days=base.weekday())
+        candidate = base + timedelta(days=1)
+        if after > candidate:  # skip whole cycles (keeps the week phase)
+            cycles = (after - candidate).days // (7 * every_weeks)
+            candidate += timedelta(weeks=cycles * every_weeks)
+        # what's left of the gap to ``after`` (under one cycle) plus one full cycle always holds a match
+        for _ in range(14 * every_weeks + 7):
+            monday = candidate.date() - timedelta(days=candidate.weekday())
+            in_active_week = ((monday - base_monday).days // 7) % every_weeks == 0
+            if in_active_week and candidate.weekday() in days and candidate > after:
+                return candidate
+            candidate += timedelta(days=1)
+        return base + timedelta(weeks=every_weeks)  # not reached: some active week has a selected day
+
+    @staticmethod
+    def _add_months(source_date: datetime, months: int, day: Optional[int] = None) -> datetime:
+        """``months`` later on ``day`` (default: the same day), clamped to the month's length."""
         month = source_date.month - 1 + months
         year = source_date.year + month // 12
         month = month % 12 + 1
-        day = min(source_date.day, calendar.monthrange(year, month)[1])
+        day = min(day or source_date.day, calendar.monthrange(year, month)[1])
         return source_date.replace(year=year, month=month, day=day)
 
     @staticmethod
@@ -141,6 +146,8 @@ class RecurrenceEngine:
         # Update occurrences count in rule
         updated_rule = dict(rule)
         updated_rule["occurrences_count"] = int(rule.get("occurrences_count", 0)) + 1
+        if rule.get("frequency") == RecurrenceFrequency.MONTHLY.value or rule.get("custom_unit") == "months":
+            updated_rule.setdefault("month_day", base_due.day)  # remember the 31st across short months
 
         # Calculate new start_date if original had one
         new_start_date = None
@@ -176,9 +183,11 @@ class RecurrenceEngine:
             due_date=next_due,
             label_ids=label_ids,
             checklist=new_checklist,
-            custom_fields=task.custom_fields,
+            # Same field values (an empty one stays empty rather than getting the field's default)
+            field_values={f["id"]: task.field_value_map.get(f["id"]) for f in service.get_custom_fields(task.board_id)},
             is_recurring=True,
             recurrence_rule=updated_rule,
+            assignee=task.assignee,
         )
 
         return new_task.id

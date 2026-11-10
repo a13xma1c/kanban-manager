@@ -13,11 +13,48 @@ dependencies = [
 
 [project.scripts]
 kanbanmanager = "kanbanmanager:main"
+kanbanmanager-capture = "kanbanmanager.app:capture_main"
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14.0"]
 build-backend = "uv_build"
 
+[dependency-groups]
+# Installed by `uv sync` (the default group): test runner, parallel runs, per-test
+# timeouts, coverage and property-based tests.
+dev = [
+    "pytest>=7.0.0",
+    "pytest-xdist>=3.5",
+    "pytest-timeout>=2.2",
+    "pytest-cov>=5.0",
+    "hypothesis>=6.100",
+]
+
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = ["src", "tests"]
 testpaths = ["tests"]
+# A hung test (an un-stubbed dialog, a dead socket) fails after 5 minutes instead of
+# blocking the run; the modal watchdog in tests/conftest.py catches most cases sooner.
+timeout = 300
+timeout_method = "thread"
+xfail_strict = true
+filterwarnings = [
+    # QTest needs the active window in offscreen runs; Qt marks the setter deprecated
+    "ignore:Function.*setActiveWindow.*:DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["kanbanmanager"]
+branch = true
+parallel = true
+concurrency = ["thread"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+precision = 1
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]

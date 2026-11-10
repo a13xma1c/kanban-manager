@@ -36,6 +36,12 @@ MIN_TIME_ENTRY_SECONDS = 30        # shorter timer runs are treated as accidenta
 DEFAULT_WEEKLY_CAPACITY_HOURS = 40.0
 DEFAULT_WORKING_DAYS = [0, 1, 2, 3, 4]  # Monday-Friday (0 = Monday)
 
+# Workflow automation
+AUTOMATION_ACTOR_PREFIX = "⚙ Automation"  # audit-trail actor for changes made by rules/policies
+AUTOMATION_SCHEDULE_INTERVAL_MS = 5 * 60 * 1000  # how often time-based rules & policies are evaluated
+AUTOMATION_MAX_CHAIN_DEPTH = 5  # rules triggering rules: stop after this many levels
+AUTOMATION_RUN_RETENTION_DAYS = 90
+
 
 def get_current_user() -> str:
     """Display name used as comment author and audit-trail actor.

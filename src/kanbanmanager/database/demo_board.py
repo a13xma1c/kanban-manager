@@ -26,12 +26,18 @@ from kanbanmanager.database.attachments import AttachmentStore, guess_content_ty
 from kanbanmanager.database.models import (
     ActivityLog,
     Attachment,
+    AutomationRule,
+    BaselineEntry,
     Board,
     BoardColumn,
     Comment,
+    CustomField,
     Label,
+    ProjectBaseline,
     Task,
     TaskDependency,
+    TaskFieldValue,
+    TaskTemplate,
     TeamMember,
     TimeEntry,
     utc_now,
@@ -57,6 +63,21 @@ DEMO_TEAM = {
     MARCUS: (40.0, [0, 1, 2, 3, 4]),
     ELENA: (16.0, [0, 1]),  # part-time
 }
+
+
+def _working_day(offset: int, hour: int = 17, minute: int = 0) -> datetime:
+    """Local date-time ``offset`` working days (Mon-Fri) from today; 0 = today, or the next
+    working day when today is a weekend."""
+    d = datetime.now().date()
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    step = 1 if offset >= 0 else -1
+    remaining = abs(offset)
+    while remaining:
+        d += timedelta(days=step)
+        if d.weekday() < 5:
+            remaining -= 1
+    return datetime.combine(d, time(hour, minute))
 
 
 class _DemoBuilder:
@@ -193,6 +214,22 @@ class _DemoBuilder:
             total = sum(e.duration_seconds for e in self.s.query(TimeEntry).filter(TimeEntry.task_id == task.id))
             task.spent_hours = total / 3600.0
 
+    def field(self, name: str, field_type: str, config: Optional[dict] = None, **kw) -> CustomField:
+        from kanbanmanager.core.custom_fields import get_field_type
+
+        f = CustomField(board_id=self.board.id, name=name, field_type=field_type,
+                        position=self.s.query(CustomField).filter(CustomField.board_id == self.board.id).count(), **kw)
+        f.config = get_field_type(field_type).normalize_config(config)
+        self.s.add(f)
+        self.s.flush()
+        return f
+
+    def set_field(self, task: Task, f: CustomField, value) -> None:
+        from kanbanmanager.core.custom_fields import validate_value
+
+        self.s.add(TaskFieldValue(task_id=task.id, field_id=f.id,
+                                  value_json=json.dumps(validate_value(f.to_dict(), value), ensure_ascii=False)))
+
     def attach(self, task: Task, filename: str, data: bytes, author: str, when: datetime, log: bool = True) -> Attachment:
         blob = self.store.store_bytes(data, filename)
         att = Attachment(task_id=task.id, filename=filename, stored_name=blob.stored_name,
@@ -309,6 +346,9 @@ This board is a **hands-on demo** of rich task content. Every card has a little 
 - [ ] Open the **Attachments** tab - images get a preview, other files open in their default app
 - [ ] Read the thread in the **Activity** tab, then post a comment of your own
 - [ ] Set the activity filter to **History** to see the complete audit trail
+- [ ] Open the **Fields** tab: story points, component and impact are *custom fields* - add your own
+  from **🧩 Fields** in the bar above the board
+- [ ] Create a card from a template: a column's **⋮** menu → **New from template**
 
 ## Formatting cheat sheet
 
@@ -336,8 +376,8 @@ New to Markdown? The [CommonMark tutorial](https://commonmark.org/help/) takes t
     onboarding = b.task(IN_REVIEW, "Design the new onboarding flow", b.ago(days=12), PRIYA, created_in=BACKLOG,
                         priority=Priority.HIGH.value, estimated_hours=12.0, assignee=ELENA)
     onboarding.labels = [b.labels["Design"], b.labels["Feature"]]
-    onboarding.due_date = (b.now + timedelta(days=3)).replace(hour=17, minute=0, second=0, microsecond=0)
-    onboarding.start_date = b.ago(days=11).date()
+    onboarding.due_date = _working_day(3)
+    onboarding.start_date = _working_day(-8).date()
     onboarding.checklist = [
         {"id": 1, "text": "Synthesise user research", "done": True},
         {"id": 2, "text": "Low-fi wireframes", "done": True},
@@ -405,7 +445,8 @@ Colours follow the existing design tokens - no new palette needed:
     # -- 3. Crash bug (in progress, urgent, blocks the CDN migration) ------
     crash = b.task(IN_PROGRESS, "Crash when importing large CSV files", b.ago(days=4), PRIYA, created_in=TODO,
                    priority=Priority.URGENT.value, labels=["Bug"], estimated_hours=5.0, assignee=MARCUS)
-    crash.due_date = (b.now + timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+    crash.due_date = _working_day(1, 12)
+    crash.start_date = _working_day(-2).date()
     shot = b.attach(crash, "crash_dialog.png", demo_images.crash_dialog(), PRIYA, b.ago(days=4) + timedelta(minutes=3))
     b.attach(crash, "crash_log.txt", _CRASH_LOG.encode(), PRIYA, b.ago(days=4) + timedelta(minutes=3))
     b.attach(crash, "sample_import.csv", _sample_csv(), MARCUS, b.ago(days=3, hours=2))
@@ -489,8 +530,7 @@ The raw numbers are in `q3_metrics.csv`.
     # -- 5. Webhook docs ---------------------------------------------------
     docs = b.task(TODO, "Write API docs for webhooks", b.ago(days=5), MARCUS,
                   priority=Priority.MEDIUM.value, labels=["Documentation", "Feature"], estimated_hours=6.0,
-                  assignee=MARCUS, start_date=b.now.date(),
-                  due_date=(b.now + timedelta(days=4)).replace(hour=17, minute=0, second=0, microsecond=0),
+                  assignee=MARCUS, start_date=_working_day(0).date(), due_date=_working_day(4),
                   checklist=[
                       {"id": 1, "text": "Event catalogue", "done": True},
                       {"id": 2, "text": "Payload reference", "done": False},
@@ -528,8 +568,7 @@ The raw numbers are in `q3_metrics.csv`.
     # -- 6. CDN migration (blocked by the crash fix) ------------------------
     cdn = b.task(BACKLOG, "Migrate attachment storage to the CDN", b.ago(days=3), MARCUS,
                  priority=Priority.MEDIUM.value, labels=["Refactor", "Improvement"], estimated_hours=16.0,
-                 assignee=MARCUS, start_date=(b.now + timedelta(days=2)).date(),
-                 due_date=(b.now + timedelta(days=11)).replace(hour=17, minute=0, second=0, microsecond=0))
+                 assignee=MARCUS, start_date=_working_day(2).date(), due_date=_working_day(9))
     cdn.description = """> Large uploads should never block the UI thread.
 > - *Storage RFC, section 2*
 
@@ -565,13 +604,14 @@ Blocked by the CSV import crash: both changes touch the same file-streaming code
 
     # -- 8. Try it yourself --------------------------------------------------
     play = b.task(TODO, "✏️ Your turn: edit this card", b.ago(hours=1), you, priority=Priority.LOW.value,
-                  labels=["Improvement"])
+                  labels=["Improvement"], assignee=you, due_date=_working_day(0))
     play.description = """This card is yours to experiment with. Nothing here matters, so go wild:
 
 - Make some text **bold**, add a heading, or turn lines into a checklist
 - Press **Ctrl+K** to add a link
 - Drag an image from your file manager into this editor, or paste a screenshot
 - Save, reopen, and check the **History** filter - every change you made is recorded
+- Fill in the **Fields** tab, then right-click the card → **Save as Template**
 """
     b.log(play, A.TASK_UPDATED, you, b.ago(hours=1) + timedelta(minutes=1), "Added a description", "description",
           "", play.description)
@@ -579,8 +619,7 @@ Blocked by the CSV import crash: both changes touch the same file-streaming code
     # -- 9. Capacity crunch (makes the workload view interesting) -----------
     launch = b.task(TODO, "Prepare launch screenshots & store listing", b.ago(days=2), PRIYA,
                     priority=Priority.HIGH.value, labels=["Design"], estimated_hours=14.0, assignee=ELENA,
-                    start_date=b.now.date(),
-                    due_date=(b.now + timedelta(days=3)).replace(hour=17, minute=0, second=0, microsecond=0))
+                    start_date=_working_day(0).date(), due_date=_working_day(3))
     launch.description = """Screenshots for every supported platform plus the store copy.
 
 > Elena is part-time (Mon/Tue). Open the **Workload** view to see why this
@@ -588,6 +627,140 @@ Blocked by the CSV import crash: both changes touch the same file-streaming code
 """
     b.log(launch, A.TASK_UPDATED, PRIYA, b.ago(days=2) + timedelta(minutes=1), "Assigned to Elena Rossi",
           "assignee", None, ELENA)
+
+    # -- Automation showcase: one task to auto-archive, one gone stale -------
+    ci = b.task(DONE, "Set up the CI pipeline", b.ago(days=30), MARCUS, created_in=TODO,
+                priority=Priority.MEDIUM.value, labels=["Improvement"], estimated_hours=3.0, assignee=MARCUS,
+                completed_at=datetime.now() - timedelta(days=20))
+    ci.description = "Lint, tests and packaging on every push.\n\n> Completed weeks ago - the **auto-archive** policy " \
+                     "will tuck it away. Find it again under **🗄 Archived**."
+    b.move(ci, MARCUS, b.ago(days=25), TODO, DONE)
+    b.log(ci, A.TASK_COMPLETED, MARCUS, b.ago(days=20), "Marked as complete", "is_completed", "Open", "Complete")
+    charts = b.task(BACKLOG, "Evaluate charting libraries for the analytics view", b.ago(days=16), PRIYA,
+                    priority=Priority.LOW.value, labels=["Feature"], estimated_hours=3.0, assignee=MARCUS)
+    charts.description = "Compare two or three options for the analytics dashboard.\n\n> Nobody has touched this " \
+                         "for a while - the **stale task** policy flags it with a label and a comment."
+    b.comment(charts, MARCUS, b.ago(days=12), "I'll look at this once the CSV crash is fixed.")
+
+    # Rules & policies ---------------------------------------------------------
+    col_id = {i: c.id for i, c in enumerate(b.cols)}
+    over_label = Label(board_id=b.board.id, name="Over estimate", color="#EF4444")
+    session.add(over_label)
+    session.flush()
+    demo_rules = [
+        ("Escalate overdue tasks", {"type": "overdue"}, [], [
+            {"type": "set_priority", "priority": Priority.URGENT.value},
+            {"type": "add_comment", "text": "⏰ '{title}' is overdue (was due {due}). Escalated to Urgent."},
+            {"type": "notify", "text": "'{title}' is overdue"},
+        ]),
+        ("Ask for review when moved to review", {"type": "task_moved", "to_column_id": col_id[IN_REVIEW]}, [], [
+            {"type": "add_comment", "text": "👀 {actor} moved this to {column} - ready for review."},
+        ]),
+        ("Triage new bugs", {"type": "label_added", "label_id": b.labels["Bug"].id}, [], [
+            {"type": "set_priority", "priority": Priority.HIGH.value},
+            {"type": "add_checklist", "items": "Reproduce the bug\nFind the root cause\nAdd a regression test"},
+        ]),
+        ("Flag time overruns", {"type": "over_estimate"}, [], [
+            {"type": "add_label", "label_id": over_label.id},
+            {"type": "add_comment", "text": "⚠ Logged time has exceeded the estimate - please re-estimate."},
+        ]),
+    ]
+    for pos, (name, trigger, conditions, actions) in enumerate(demo_rules):
+        session.add(AutomationRule(board_id=b.board.id, name=name, position=pos, is_enabled=True,
+                                   trigger_json=json.dumps(trigger), conditions_json=json.dumps(conditions),
+                                   actions_json=json.dumps(actions)))
+    b.board.policies = {
+        "auto_archive": {"enabled": True, "days": 14},
+        "stale": {"enabled": True, "days": 10, "label": "Stale", "comment": True, "notify": True,
+                  "move_to_column_id": None, "exclude_column_ids": []},
+        "archive_stale": {"enabled": False, "days": 60},
+    }
+
+    # -- Custom fields & task templates ----------------------------------------
+    points = b.field("Story points", "number", {"unit": "pts", "min": 0, "max": 100, "show_total": True},
+                     description="Relative effort - the column headers add them up")
+    component = b.field("Component", "select", {"options": [
+        {"label": "Frontend", "color": "#3B82F6"}, {"label": "Backend", "color": "#10B981"},
+        {"label": "Data", "color": "#F59E0B"}, {"label": "Docs", "color": "#8B5CF6"}]})
+    impact = b.field("Customer impact", "rating", {"max": 5}, description="How much customers will notice")
+    spec = b.field("Spec", "url", description="Design file or RFC")
+    reviewer = b.field("Reviewer", "person", show_on_card=False)
+    for task_obj, values in (
+        (welcome, {component: "Docs", points: 1}),
+        (onboarding, {component: "Frontend", points: 8, impact: 4, spec: "https://www.figma.com/file/onboarding-v2",
+                      reviewer: MARCUS}),
+        (crash, {component: "Data", points: 5, impact: 5}),
+        (report, {component: "Docs", points: 3, reviewer: MARCUS}),
+        (docs, {component: "Docs", points: 3, spec: "https://example.com/rfcs/webhooks"}),
+        (cdn, {component: "Backend", points: 8, impact: 3}),
+        (launch, {component: "Frontend", points: 5, impact: 4}),
+        (ci, {component: "Backend", points: 2}),
+        (charts, {component: "Frontend", points: 3, impact: 2}),
+    ):
+        for f_obj, value in values.items():
+            b.set_field(task_obj, f_obj, value)
+    b.log(onboarding, A.TASK_UPDATED, ELENA, b.ago(days=8), "Set Story points to 5 pts", "custom_field", None, "5 pts")
+    b.log(onboarding, A.TASK_UPDATED, ELENA, b.ago(days=4), "Changed Story points from 5 pts to 8 pts",
+          "custom_field", "5 pts", "8 pts")
+    b.comment(onboarding, ELENA, b.ago(days=4) + timedelta(minutes=2),
+              "Re-estimated to 8 points - the empty-state illustrations took longer than planned.")
+    session.add(TaskTemplate(board_id=b.board.id, name="Bug report", icon="🐞", position=0, created_by=MARCUS,
+                             data_json=json.dumps({
+                                 "title": "Bug: ", "priority": Priority.HIGH.value, "labels": ["Bug"],
+                                 "description": "## Steps to reproduce\n1. Go to …\n2. Click …\n\n## Expected\n…\n\n"
+                                                "## Actual\n…\n",
+                                 "checklist": ["Reproduce", "Write a failing test", "Fix", "Verify"],
+                                 "fields": {"Story points": 2}}, ensure_ascii=False)))
+    session.add(TaskTemplate(board_id=b.board.id, name="Weekly status report", icon="📝", position=1, created_by=PRIYA,
+                             data_json=json.dumps({
+                                 "title": "Status report - week {week}", "assignee": "@me", "due_in_days": 2,
+                                 "labels": ["Documentation"], "column": "To Do",
+                                 "description": "Written by {user} on {today}.\n\n## Done\n\n## Next\n\n"
+                                                "## Risks\n",
+                                 "checklist": ["Collect updates", "Write the summary", "Share with the team"],
+                                 "fields": {"Component": "Docs", "Story points": 1}}, ensure_ascii=False)))
+
+    # -- Schedule: milestones, dependency network, baseline ------------------
+    beta = b.task(TODO, "🚀 Public beta", b.ago(days=10), PRIYA, priority=Priority.HIGH.value, assignee=PRIYA,
+                  is_milestone=True, dates_locked=True, start_date=_working_day(7).date(), due_date=_working_day(7))
+    beta.description = ("The date we announced publicly - **locked** 📌 so auto-scheduling and cascading never move "
+                        "it. Everything feeding into it is on the critical path; open the **Gantt** view.")
+    b.log(beta, A.TASK_UPDATED, PRIYA, b.ago(days=10) + timedelta(minutes=1), "Marked as a milestone",
+          "is_milestone", "False", "True")
+    ga = b.task(BACKLOG, "🏁 General availability", b.ago(days=10), PRIYA, priority=Priority.MEDIUM.value,
+                assignee=PRIYA, is_milestone=True, start_date=_working_day(11).date(), due_date=_working_day(11))
+    b.log(ga, A.TASK_UPDATED, PRIYA, b.ago(days=10) + timedelta(minutes=2), "Marked as a milestone",
+          "is_milestone", "False", "True")
+    FS_, SS_ = "FINISH_TO_START", "START_TO_START"
+    schedule_links = [
+        (launch, onboarding, SS_, 2, ELENA),   # screenshots can start 2 days after design starts
+        (beta, onboarding, FS_, 0, PRIYA),
+        (beta, launch, FS_, 0, PRIYA),
+        (beta, crash, FS_, 0, PRIYA),
+        (docs, crash, FS_, 0, MARCUS),         # deliberately violated: docs is planned to start before the fix
+        (ga, cdn, FS_, 2, PRIYA),              # GA two working days after the CDN migration (critical path)
+    ]
+    for succ, pred, kind, lag, who in schedule_links:
+        session.add(TaskDependency(task_id=succ.id, depends_on_task_id=pred.id, dependency_type=kind, lag_days=lag))
+        linked_at = min(max(succ.created_at, pred.created_at) + timedelta(hours=1), b.now)  # after both exist
+        b.log(succ, A.DEPENDENCY_ADDED, who, linked_at, f"Now depends on #{pred.id} '{pred.title}'",
+              "dependency", None, pred.title)
+
+    # A baseline saved at sprint planning; several tasks have slipped since
+    plan = ProjectBaseline(board_id=b.board.id, name="Sprint plan", created_by=PRIYA, created_at=b.ago(days=6))
+    session.add(plan)
+    session.flush()
+    planned = [  # (task, baseline start offset, baseline finish offset) in working days from today
+        (onboarding, -8, 1), (crash, -4, -1), (launch, -1, 2), (docs, 0, 4), (cdn, 1, 8),
+        (beta, 7, 7), (ga, 10, 10),
+    ]
+    for task_obj, s_off, f_off in planned:
+        session.add(BaselineEntry(
+            baseline_id=plan.id, task_id=task_obj.id, title=task_obj.title,
+            start_date=_working_day(s_off).date(), finish_date=_working_day(f_off).date(),
+            duration_days=0 if task_obj.is_milestone else f_off - s_off + 1, is_milestone=bool(task_obj.is_milestone),
+        ))
+    b.board.schedule_settings = {"cascade": True, "baseline_id": plan.id}
 
     # -- Logged time (past two weeks, local working hours) -----------------
     P, S = TimeEntrySource.POMODORO, TimeEntrySource.STOPWATCH
@@ -604,6 +777,7 @@ Blocked by the CSV import crash: both changes touch the same file-streaming code
     b.track(docs, MARCUS, 1, 16, 40, S)
     b.track(sync, PRIYA, 7, 10, 30, S, "Weekly sync")
     b.track(welcome, PRIYA, 7, 8.5, 30, P, "Write the tour")
+    b.track(ci, MARCUS, 24, 10, 150, S, "Pipeline config")
     b.finish_time()
 
     session.flush()

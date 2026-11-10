@@ -87,6 +87,12 @@ QPushButton#DangerButton:hover {
     background-color: #DC2626;
 }
 
+QPushButton#PrimaryButton:disabled, QPushButton#SuccessButton:disabled, QPushButton#DangerButton:disabled {
+    background-color: #1E293B;
+    color: #64748B;
+    border: 1px solid #334155;
+}
+
 QPushButton#IconButton {
     background-color: transparent;
     border: none;
@@ -306,6 +312,42 @@ QTabBar::tab:selected {
 """
 
 
+FOCUS_QSS = """
+/* Keyboard accessibility: a clearly visible focus ring (mouse use is unaffected) */
+QPushButton:focus, QToolButton:focus, QCheckBox:focus, QRadioButton:focus {
+    border: 1px solid #3B82F6;
+}
+QComboBox:focus, QAbstractSpinBox:focus, QDateEdit:focus, QDateTimeEdit:focus {
+    border: 1px solid #3B82F6;
+}
+#TaskCardWidget:focus {
+    border: 2px solid #60A5FA;
+}
+/* The keyboard-selected card (vim navigation) */
+#TaskCardWidget[selected="true"] {
+    border: 2px solid #3B82F6;
+    background-color: #243046;
+}
+"""
+
+
 def get_stylesheet() -> str:
     """Return the application QSS stylesheet."""
-    return DARK_THEME_QSS
+    return DARK_THEME_QSS + FOCUS_QSS
+
+
+# Visible checkbox indicators for dialogs built on the dark theme (the global sheet leaves them
+# almost invisible when unchecked). Applied to the automation, archive and team dialogs.
+CHECKBOX_QSS = """
+QCheckBox::indicator, QListWidget::indicator, QTableWidget::indicator, QTreeWidget::indicator {
+    width: 14px; height: 14px; border: 1px solid #64748B; border-radius: 3px; background: #0F172A;
+}
+QCheckBox::indicator:hover, QListWidget::indicator:hover, QTableWidget::indicator:hover,
+QTreeWidget::indicator:hover { border-color: #94A3B8; }
+QCheckBox::indicator:checked, QListWidget::indicator:checked, QTableWidget::indicator:checked,
+QTreeWidget::indicator:checked {
+    background: #3B82F6; border-color: #3B82F6;
+}
+QCheckBox::indicator:disabled { border-color: #334155; background: #1E293B; }
+QCheckBox::indicator:checked:disabled { background: #1E3A8A; }
+"""

@@ -113,6 +113,7 @@ class AttachmentsPanel(QWidget):
         layout.addWidget(hint)
 
         body = QHBoxLayout()
+        layout.addLayout(body, 1)  # attach first: a parentless layout + self-capturing lambda double-frees in PySide6
         body.setSpacing(10)
 
         self.list = _DropList()
@@ -143,9 +144,9 @@ class AttachmentsPanel(QWidget):
         self.preview_info.setStyleSheet("color: #94A3B8; font-size: 11px; background: transparent; border: none;")
         pv.addWidget(self.preview_info)
         body.addWidget(preview, 2)
-        layout.addLayout(body, 1)
 
         btns = QHBoxLayout()
+        layout.addLayout(btns)  # attach first: a parentless layout + self-capturing lambda double-frees in PySide6
         self.add_btn = QPushButton("📎 Add Files...")
         self.add_btn.clicked.connect(self._browse)
         btns.addWidget(self.add_btn)
@@ -164,7 +165,6 @@ class AttachmentsPanel(QWidget):
         self.remove_btn.setObjectName("DangerButton")
         self.remove_btn.clicked.connect(self.remove_selected)
         btns.addWidget(self.remove_btn)
-        layout.addLayout(btns)
         self._update_buttons()
 
     # ------------------------------------------------------------------

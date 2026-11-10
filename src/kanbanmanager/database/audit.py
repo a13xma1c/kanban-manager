@@ -12,7 +12,7 @@ never produces a spurious history entry.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +26,7 @@ class Change:
     details: str
     old_value: Optional[str] = None
     new_value: Optional[str] = None
+    data: Optional[Dict[str, Any]] = field(default=None, compare=False, hash=False)  # event payload
 
 
 def _fmt_datetime(value: Optional[datetime]) -> Optional[str]:
@@ -66,6 +67,8 @@ def snapshot_task(task, column_name: str = "") -> Dict[str, Any]:
         "description": task.description or "",
         "priority": task.priority,
         "assignee": (task.assignee or "").strip(),
+        "is_milestone": bool(task.is_milestone),
+        "dates_locked": bool(task.dates_locked),
         "column_id": task.column_id,
         "column_name": column_name,
         "estimated_hours": round(float(task.estimated_hours or 0.0), 2),
@@ -80,8 +83,57 @@ def snapshot_task(task, column_name: str = "") -> Dict[str, Any]:
         "is_recurring": bool(task.is_recurring),
         # occurrences_count is engine bookkeeping, not a user edit
         "recurrence": {k: v for k, v in rule.items() if k != "occurrences_count"} if task.is_recurring else {},
-        "custom_fields": json.dumps(task.custom_fields or {}, sort_keys=True),
+        "fields": snapshot_field_values(task),
     }
+
+
+def snapshot_field_values(task) -> Dict[int, Dict[str, Any]]:
+    """Non-empty custom field values: field id -> name, position, raw value and display text."""
+    from kanbanmanager.core.custom_fields import get_field_type
+
+    out: Dict[int, Dict[str, Any]] = {}
+    for fv in task.field_values:
+        f = fv.field
+        if f is None:
+            continue
+        ftype = get_field_type(f.field_type)
+        value = fv.value
+        if ftype.is_empty(value):
+            continue
+        out[f.id] = {"name": f.name, "position": f.position, "value": value,
+                     "raw": json.dumps(value, sort_keys=True, ensure_ascii=False),
+                     "text": ftype.format(value, f.config)}
+    return out
+
+
+def _short(text: str, limit: int = 60) -> str:
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def field_change_details(name: str, old_text: Optional[str], new_text: Optional[str]) -> str:
+    if not old_text:
+        return f"Set {name} to {_short(new_text)}"
+    if not new_text:
+        return f"Cleared {name} (was {_short(old_text)})"
+    return f"Changed {name} from {_short(old_text)} to {_short(new_text)}"
+
+
+def _field_changes(old: Dict[int, Dict[str, Any]], new: Dict[int, Dict[str, Any]]) -> List[Change]:
+    changes: List[Change] = []
+    ids = sorted(set(old) | set(new), key=lambda i: ((new.get(i) or old.get(i))["position"], i))
+    for fid in ids:
+        o, n = old.get(fid), new.get(fid)
+        if (o or {}).get("raw") == (n or {}).get("raw"):
+            continue
+        name = (n or o)["name"]
+        o_text, n_text = (o or {}).get("text"), (n or {}).get("text")
+        changes.append(Change(
+            ActivityAction.TASK_UPDATED, "custom_field", field_change_details(name, o_text, n_text),
+            o_text, n_text,
+            data={"field_id": fid, "field_name": name, "from": (o or {}).get("value"), "to": (n or {}).get("value")},
+        ))
+    return changes
 
 
 def _checklist_changes(old: List[Dict[str, Any]], new: List[Dict[str, Any]]) -> List[str]:
@@ -200,7 +252,14 @@ def diff_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> List[Change]:
                 details = f"Changed recurrence from {o} to {n}"
             changes.append(Change(U, "recurrence", details, o, n))
 
-    if old["custom_fields"] != new["custom_fields"]:
-        changes.append(Change(U, "custom_fields", "Updated custom fields", old["custom_fields"], new["custom_fields"]))
+    if old["is_milestone"] != new["is_milestone"]:
+        changes.append(Change(U, "is_milestone", "Marked as a milestone" if new["is_milestone"]
+                              else "No longer a milestone", str(old["is_milestone"]), str(new["is_milestone"])))
+    if old["dates_locked"] != new["dates_locked"]:
+        changes.append(Change(U, "dates_locked", "Locked its dates (auto-scheduling won't move it)"
+                              if new["dates_locked"] else "Unlocked its dates",
+                              str(old["dates_locked"]), str(new["dates_locked"])))
+
+    changes.extend(_field_changes(old["fields"], new["fields"]))
 
     return changes

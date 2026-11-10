@@ -24,6 +24,7 @@ from kanbanmanager.database.connection import DatabaseManager
 from kanbanmanager.database.demo_board import DEMO_BOARD_NAME
 from kanbanmanager.database.models import ActivityLog, Attachment, utc_now
 from kanbanmanager.enums import ActivityAction as A
+from support import seeded_manager
 
 
 @pytest.fixture
@@ -262,8 +263,7 @@ def test_current_user_override(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_legacy_database_is_migrated(tmp_path):
     db = tmp_path / "legacy.db"
-    mgr = DatabaseManager(db)
-    mgr.init_database(seed_defaults=True)
+    mgr = seeded_manager(db)
     mgr.engine.dispose()
     # Recreate activity_logs exactly as the previous release defined it
     con = sqlite3.connect(db)
@@ -324,7 +324,7 @@ def test_json_roundtrip_preserves_rich_content(env, tmp_path):
 
     dest = backups.export_to_json(tmp / "export.json")
     exported = json.loads(dest.read_text())
-    assert exported["version"] == "1.2"
+    assert exported["version"] == "1.6"
 
     # Shift ids in the target DB so a stale attachment id in the description would be detectable
     new_mgr = DatabaseManager(tmp_path / "imported" / "k.db")
@@ -380,7 +380,7 @@ def test_import_of_legacy_json_without_rich_content(env, tmp_path):
 # ---------------------------------------------------------------------------
 def _check_demo_board(service, mgr, board_id):
     tasks = service.get_tasks_for_board(board_id)
-    assert len(tasks) == 9
+    assert len(tasks) == 13
     with mgr.session_scope() as session:
         for task in tasks:
             atts = {str(a.id) for a in session.query(Attachment).filter(Attachment.task_id == task.id)}
@@ -408,7 +408,7 @@ def _check_demo_board(service, mgr, board_id):
 
 
 def test_fresh_database_seeds_demo_board(tmp_path):
-    mgr = DatabaseManager(tmp_path / "fresh.db")
+    mgr = DatabaseManager(tmp_path / "fresh.db")  # the real seeding path, not the test cache
     mgr.init_database(seed_defaults=True)
     service = DatabaseService(mgr)
     boards = service.get_workspaces()[0].boards

@@ -110,6 +110,7 @@ class TimesheetDialog(QDialog):
         layout.addWidget(self.table, 1)
 
         buttons = QHBoxLayout()
+        layout.addLayout(buttons)  # attach first: a parentless layout + self-capturing lambda double-frees in PySide6
         self.note_lbl = QLabel("Times are in your local time zone. Running timers appear once stopped.")
         self.note_lbl.setStyleSheet("color: #64748B; font-size: 11px;")
         buttons.addWidget(self.note_lbl)
@@ -126,7 +127,6 @@ class TimesheetDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         for b in (self.csv_btn, self.summary_btn, self.pdf_btn, close_btn):
             buttons.addWidget(b)
-        layout.addLayout(buttons)
 
     # ------------------------------------------------------------------
     def period(self) -> tuple[date, date]:

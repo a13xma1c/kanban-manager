@@ -24,6 +24,18 @@ from kanbanmanager.enums import Priority, ColumnType
 _ADDED_COLUMNS = {
     "tasks": [
         ("assignee", "VARCHAR(120)"),
+        ("is_archived", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("archived_at", "DATETIME"),
+        ("archive_reason", "VARCHAR(200)"),
+        ("is_milestone", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("dates_locked", "BOOLEAN NOT NULL DEFAULT 0"),
+    ],
+    "boards": [
+        ("policies_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("schedule_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ],
+    "task_dependencies": [
+        ("lag_days", "INTEGER NOT NULL DEFAULT 0"),
     ],
     "activity_logs": [
         ("actor", "VARCHAR(120)"),
@@ -34,6 +46,16 @@ _ADDED_COLUMNS = {
 }
 _ADDED_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_activity_task_time ON activity_logs (task_id, timestamp)",
+    # Foreign keys the app filters and joins on (SQLite doesn't index foreign keys by itself)
+    "CREATE INDEX IF NOT EXISTS idx_tasks_board ON tasks (board_id, is_archived)",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_column ON tasks (column_id, position)",
+    "CREATE INDEX IF NOT EXISTS idx_columns_board ON board_columns (board_id, position)",
+    "CREATE INDEX IF NOT EXISTS idx_labels_board ON labels (board_id)",
+    "CREATE INDEX IF NOT EXISTS idx_boards_workspace ON boards (workspace_id, position)",
+    "CREATE INDEX IF NOT EXISTS idx_task_dep_prereq ON task_dependencies (depends_on_task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_task_labels_label ON task_labels (label_id)",
+    "CREATE INDEX IF NOT EXISTS idx_reminders_task ON reminders (task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_activity_board_time ON activity_logs (board_id, timestamp)",
 ]
 # Before time entries existed, "spent hours" was a bare number on the task. Turn any such
 # value into a single manual entry so totals stay consistent (idempotent: only tasks
@@ -112,6 +134,61 @@ class DatabaseManager:
             for stmt in _ADDED_INDEXES:
                 conn.execute(text(stmt))
             conn.execute(text(_BACKFILL_SPENT_HOURS))
+        self._migrate_legacy_custom_fields()
+
+    def _migrate_legacy_custom_fields(self) -> None:
+        """Before typed custom fields, tasks kept a free-form {"name": value} JSON dict. Turn
+        each name into a real field on the task's board (type inferred from the values) and move
+        the values over. Idempotent: migrated tasks have their legacy dict cleared."""
+        import json
+
+        from kanbanmanager.core import custom_fields as cf
+        from kanbanmanager.database.models import CustomField, TaskFieldValue
+
+        with self.session_scope() as session:
+            rows = session.execute(text(
+                "SELECT id, board_id, custom_fields_json FROM tasks WHERE custom_fields_json IS NOT NULL "
+                "AND TRIM(custom_fields_json) NOT IN ('', '{}', 'null')")).all()
+            if not rows:
+                return
+            per_board: dict = {}
+            for task_id, board_id, raw in rows:
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(data, dict):
+                    for name, value in data.items():
+                        per_board.setdefault(board_id, {}).setdefault(str(name), []).append((task_id, value))
+            for board_id, fields in per_board.items():
+                existing = {f.name.lower(): f for f in session.query(CustomField).filter_by(board_id=board_id)}
+                for name, items in fields.items():
+                    try:
+                        clean = cf.normalize_name(name)
+                    except cf.FieldValueError:
+                        continue
+                    f = existing.get(clean.lower())
+                    if f is None:
+                        ftype, config = cf.infer_type([v for _t, v in items])
+                        f = CustomField(board_id=board_id, name=clean, field_type=ftype, position=len(existing),
+                                        show_on_card=True, description="Migrated from an earlier version")
+                        f.config = config
+                        session.add(f)
+                        session.flush()
+                        existing[clean.lower()] = f
+                    definition = f.to_dict()
+                    for task_id, value in items:
+                        try:
+                            value = cf.validate_value(definition, cf.legacy_value(value, f.field_type))
+                        except cf.FieldValueError:
+                            continue
+                        if value is None or session.query(TaskFieldValue).filter_by(
+                                task_id=task_id, field_id=f.id).first() is not None:
+                            continue
+                        session.add(TaskFieldValue(task_id=task_id, field_id=f.id,
+                                                   value_json=json.dumps(value, ensure_ascii=False)))
+            session.execute(text("UPDATE tasks SET custom_fields_json = '{}' WHERE id IN (%s)"
+                                 % ",".join(str(int(r[0])) for r in rows)))
 
     @contextmanager
     def session_scope(self) -> Generator[Session, None, None]:
@@ -237,6 +314,20 @@ class DatabaseManager:
         from kanbanmanager.database.demo_board import build_demo_board
 
         build_demo_board(session, ws.id, self.attachment_store)
+
+        # A couple of captured thoughts so the Global Inbox isn't empty on first run
+        from kanbanmanager.config import get_current_user
+        from kanbanmanager.database.models import InboxItem
+
+        you = get_current_user()
+        for title, raw, priority, labels in (
+            ("Try Quick Capture from any app", "Try Quick Capture from any app (Ctrl+Shift+Space)", None, []),
+            ("Idea: dark mode for the timesheet PDF", "Idea: dark mode for the timesheet PDF #Design",
+             None, ["Design"]),
+        ):
+            item = InboxItem(title=title, raw_text=raw, priority=priority, source="demo", captured_by=you)
+            item.labels = labels
+            session.add(item)
 
 
 # Global DB Manager Instance

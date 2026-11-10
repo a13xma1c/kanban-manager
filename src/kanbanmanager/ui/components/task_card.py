@@ -19,6 +19,7 @@ from PySide6.QtGui import (
     QLinearGradient,
 )
 from PySide6.QtWidgets import (
+    QMessageBox,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -36,9 +37,22 @@ from kanbanmanager.core.markdown_utils import first_line_snippet
 from kanbanmanager.core.signals import app_signals
 from kanbanmanager.ui.components.activity_panel import avatar_color, initials
 from kanbanmanager.ui.components.flow_layout import FlowLayout
+from kanbanmanager.ui.colors import alpha, chip_style
+from kanbanmanager.core import custom_fields as cf
 
 
 MIME_TASK_ID = "application/x-kanban-task-id"
+
+
+def confirm_task_deletion(parent: Optional[QWidget], task: Dict[str, Any]) -> bool:
+    """Ask before deleting a task for good (``app_signals.task_deleted`` means: confirmed)."""
+    extras = [f"{n} {what}{'s' if n != 1 else ''}" for n, what in
+              ((task.get("comment_count", 0), "comment"), (task.get("attachment_count", 0), "attachment")) if n]
+    detail = f"\n\nIts {' and '.join(extras)} and logged time go with it." if extras else ""
+    return QMessageBox.question(
+        parent, "Delete Task", f"Permanently delete '{task.get('title', '')}'?{detail}\n\n"
+        "Archive it instead to keep it out of the way but restorable.",
+        QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
 
 
 class TaskCardWidget(QFrame):
@@ -48,9 +62,12 @@ class TaskCardWidget(QFrame):
     due date warnings, and dependency badges.
     """
 
-    def __init__(self, task_data: Dict[str, Any], parent: Optional[QWidget] = None):
+    def __init__(self, task_data: Dict[str, Any], parent: Optional[QWidget] = None,
+                 fields: Optional[List[Dict[str, Any]]] = None):
+        """``fields``: the board's custom field definitions (values shown as chips)."""
         super().__init__(parent)
         self.task_data = task_data
+        self.fields = fields or []
         self.task_id = task_data.get("id", 0)
         self.column_id = task_data.get("column_id", 0)
         self.board_id = task_data.get("board_id", 0)
@@ -61,8 +78,51 @@ class TaskCardWidget(QFrame):
         self.setFrameShape(QFrame.StyledPanel)
         self.setCursor(Qt.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self.setFocusPolicy(Qt.StrongFocus)   # reachable with Tab; vim keys select it too
+        self.setAccessibleName(self._describe())
 
         self._init_ui()
+
+    def _describe(self) -> str:
+        """What a screen reader announces for this card."""
+        t = self.task_data
+        parts = [f"Task: {t.get('title', '')}"]
+        if t.get("is_completed"):
+            parts.append("completed")
+        if t.get("priority"):
+            try:
+                parts.append(f"priority {Priority(t['priority']).display_name}")
+            except ValueError:
+                pass
+        if t.get("due_date"):
+            parts.append(("overdue, was due " if t.get("is_overdue") else "due ") + t["due_date"][:10])
+        if t.get("assignee"):
+            parts.append(f"assigned to {t['assignee']}")
+        if t.get("is_blocked"):
+            parts.append("blocked by prerequisites")
+        return ", ".join(parts)
+
+    def set_selected(self, selected: bool) -> None:
+        """The keyboard-navigation highlight (styled via TaskCardWidget[selected="true"])."""
+        if (self.property("selected") == "true") == selected:
+            return
+        self.setProperty("selected", "true" if selected else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    @property
+    def is_selected(self) -> bool:
+        return self.property("selected") == "true"
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        app_signals.card_focused.emit(self.task_id)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            app_signals.task_edit_requested.emit(self.task_id)
+        else:
+            super().keyPressEvent(event)
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -72,8 +132,8 @@ class TaskCardWidget(QFrame):
         # ---------------------------------------------------------------------
         # Top Row: Labels + Priority Badge
         # ---------------------------------------------------------------------
-        top_row = QHBoxLayout()
-        top_row.setSpacing(4)
+        # Labels + priority wrap (like the badges below) so cards fit narrow columns, e.g. in Split View
+        top_row = FlowLayout(h_spacing=4, v_spacing=4)
 
         # Labels container
         labels = self.task_data.get("labels", [])
@@ -81,17 +141,12 @@ class TaskCardWidget(QFrame):
             for lbl in labels[:3]:  # Show first 3 labels
                 lbl_pill = QLabel(lbl.get("name", ""))
                 color = lbl.get("color", "#3B82F6")
-                lbl_pill.setStyleSheet(
-                    f"background-color: {color}22; color: {color}; border: 1px solid {color}66; "
-                    f"border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 600;"
-                )
+                lbl_pill.setStyleSheet(chip_style(color))
                 top_row.addWidget(lbl_pill)
             if len(labels) > 3:
                 more_lbl = QLabel(f"+{len(labels) - 3}")
                 more_lbl.setStyleSheet("color: #94A3B8; font-size: 10px;")
                 top_row.addWidget(more_lbl)
-
-        top_row.addStretch()
 
         # Priority badge
         pri_val = self.task_data.get("priority", Priority.MEDIUM.value)
@@ -102,8 +157,8 @@ class TaskCardWidget(QFrame):
 
         pri_badge = QLabel(f"{pri_enum.icon_char} {pri_enum.display_name}")
         pri_badge.setStyleSheet(
-            f"color: {pri_enum.color}; background-color: {pri_enum.color}18; "
-            f"border: 1px solid {pri_enum.color}44; border-radius: 4px; "
+            f"color: {pri_enum.color}; background-color: {alpha(pri_enum.color, 0x18)}; "
+            f"border: 1px solid {alpha(pri_enum.color, 0x44)}; border-radius: 4px; "
             f"padding: 2px 6px; font-size: 10px; font-weight: bold;"
         )
         top_row.addWidget(pri_badge)
@@ -118,6 +173,8 @@ class TaskCardWidget(QFrame):
         # Complete check button
         self.check_btn = QPushButton("✓" if self.task_data.get("is_completed") else "○")
         self.check_btn.setFixedSize(22, 22)
+        self.check_btn.setAccessibleName("Mark incomplete" if self.task_data.get("is_completed") else "Mark complete")
+        self.check_btn.setToolTip("Mark incomplete" if self.task_data.get("is_completed") else "Mark complete")
         if self.task_data.get("is_completed"):
             self.check_btn.setStyleSheet(
                 "background-color: #10B981; color: #FFFFFF; border-radius: 11px; font-weight: bold; border: none;"
@@ -149,6 +206,39 @@ class TaskCardWidget(QFrame):
             desc_lbl.setWordWrap(True)  # never let a long snippet widen the card past its column
             desc_lbl.setStyleSheet("color: #94A3B8; font-size: 11px;")
             layout.addWidget(desc_lbl)
+
+        # ---------------------------------------------------------------------
+        # Custom fields shown on cards (and a warning for required ones left empty)
+        # ---------------------------------------------------------------------
+        self.field_chips: List[QLabel] = []
+        if self.fields:
+            values = self.task_data.get("field_values") or {}
+            field_row = FlowLayout(h_spacing=4, v_spacing=4)
+            for f in self.fields:
+                if not f.get("show_on_card"):
+                    continue
+                for chip in cf.value_chips(f, values.get(f["id"])):
+                    pill = QLabel(chip.text)
+                    pill.setTextFormat(Qt.PlainText)
+                    pill.setToolTip(chip.tooltip)
+                    if chip.color:
+                        pill.setStyleSheet(chip_style(chip.color))
+                    else:
+                        pill.setStyleSheet("color: #CBD5E1; background-color: #263244; border: 1px solid #334155; "
+                                           "border-radius: 4px; padding: 1px 6px; font-size: 10px;")
+                    field_row.addWidget(pill)
+                    self.field_chips.append(pill)
+            missing = cf.missing_required(self.fields, values)
+            if missing and not self.task_data.get("is_completed"):
+                warn = QLabel(f"⚠ {len(missing)} required field{'s' if len(missing) != 1 else ''}")
+                warn.setToolTip("Missing: " + ", ".join(missing))
+                warn.setStyleSheet(chip_style("#F97316"))
+                field_row.addWidget(warn)
+                self.field_chips.append(warn)
+            if self.field_chips:
+                layout.addLayout(field_row)
+            else:
+                field_row.deleteLater()
 
         # ---------------------------------------------------------------------
         # Checklist Progress
@@ -197,12 +287,12 @@ class TaskCardWidget(QFrame):
                 due_badge = QLabel(f"📅 {due_str}")
                 if is_overdue:
                     due_badge.setStyleSheet(
-                        "color: #EF4444; background-color: #EF444422; border: 1px solid #EF444466; "
+                        "color: #EF4444; background-color: rgba(239, 68, 68, 34); border: 1px solid rgba(239, 68, 68, 102); "
                         "border-radius: 4px; padding: 1px 5px; font-size: 10px; font-weight: bold;"
                     )
                 else:
                     due_badge.setStyleSheet(
-                        "color: #38BDF8; background-color: #0284C722; border: 1px solid #0284C744; "
+                        "color: #38BDF8; background-color: rgba(2, 132, 199, 34); border: 1px solid rgba(2, 132, 199, 68); "
                         "border-radius: 4px; padding: 1px 5px; font-size: 10px;"
                     )
                 bottom_row.addWidget(due_badge)
@@ -214,14 +304,14 @@ class TaskCardWidget(QFrame):
             blocked_badge = QLabel("🔒 Blocked")
             blocked_badge.setToolTip("Waiting on unfinished prerequisite tasks")
             blocked_badge.setStyleSheet(
-                "color: #EF4444; background-color: #EF444422; border: 1px solid #EF444466; "
+                "color: #EF4444; background-color: rgba(239, 68, 68, 34); border: 1px solid rgba(239, 68, 68, 102); "
                 "border-radius: 4px; padding: 1px 5px; font-size: 10px; font-weight: bold;"
             )
             bottom_row.addWidget(blocked_badge)
         elif self.task_data.get("prerequisites"):
             prereq_badge = QLabel(f"🔗 {len(self.task_data['prerequisites'])} prereqs")
             prereq_badge.setStyleSheet(
-                "color: #10B981; background-color: #10B98122; border: 1px solid #10B98144; "
+                "color: #10B981; background-color: rgba(16, 185, 129, 34); border: 1px solid rgba(16, 185, 129, 68); "
                 "border-radius: 4px; padding: 1px 5px; font-size: 10px;"
             )
             bottom_row.addWidget(prereq_badge)
@@ -230,7 +320,7 @@ class TaskCardWidget(QFrame):
         if self.task_data.get("is_recurring"):
             rec_badge = QLabel("🔁 Recurring")
             rec_badge.setStyleSheet(
-                "color: #A855F7; background-color: #A855F722; border: 1px solid #A855F744; "
+                "color: #A855F7; background-color: rgba(168, 85, 247, 34); border: 1px solid rgba(168, 85, 247, 68); "
                 "border-radius: 4px; padding: 1px 5px; font-size: 10px;"
             )
             bottom_row.addWidget(rec_badge)
@@ -247,6 +337,21 @@ class TaskCardWidget(QFrame):
                 counter.setToolTip(f"{n} {tip}{'s' if n != 1 else ''}")
                 counter.setStyleSheet("color: #94A3B8; font-size: 10px;")
                 bottom_row.addWidget(counter)
+
+        # Scheduling flags
+        if self.task_data.get("is_milestone"):
+            ms = QLabel("◆ Milestone")
+            ms.setToolTip("A point in time on the project schedule")
+            ms.setStyleSheet(
+                "color: #FBBF24; background-color: #422006; border: 1px solid #92400E; "
+                "border-radius: 4px; padding: 1px 5px; font-size: 10px; font-weight: bold;"
+            )
+            bottom_row.addWidget(ms)
+        if self.task_data.get("dates_locked"):
+            lock = QLabel("📌")
+            lock.setToolTip("Dates locked: auto-scheduling and cascading never move this task")
+            lock.setStyleSheet("font-size: 10px;")
+            bottom_row.addWidget(lock)
 
         # Live timer indicator
         if self.task_data.get("timer_running"):
@@ -294,6 +399,10 @@ class TaskCardWidget(QFrame):
         """Trigger completion toggle signal."""
         app_signals.task_completed_toggled.emit(self.task_id, not self.task_data.get("is_completed", False))
 
+    def _delete(self, _checked: bool = False) -> None:
+        if confirm_task_deletion(self, self.task_data):
+            app_signals.task_deleted.emit(self.task_id)
+
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
             self._drag_start_pos = event.position().toPoint()
@@ -320,7 +429,7 @@ class TaskCardWidget(QFrame):
         pixmap.fill(Qt.transparent)
         painter = QPainter(pixmap)
         painter.setOpacity(0.85)
-        self.render(painter)
+        self.render(painter, QPoint(0, 0))  # PySide6 needs the offset for the QPainter overload
         painter.end()
 
         drag.setPixmap(pixmap)
@@ -352,8 +461,11 @@ class TaskCardWidget(QFrame):
             menu.addAction("🍅 Start Pomodoro", lambda: app_signals.timer_start_requested.emit(self.task_id, "pomodoro"))
 
         menu.addSeparator()
+        menu.addAction("📋 Save as Template…", lambda: app_signals.task_template_save_requested.emit(self.task_id))
+        menu.addSeparator()
 
+        menu.addAction("🗄 Archive Task", lambda: app_signals.task_archive_requested.emit(self.task_id))
         del_act = menu.addAction("🗑 Delete Task")
-        del_act.triggered.connect(lambda: app_signals.task_deleted.emit(self.task_id))
+        del_act.triggered.connect(self._delete)
 
         menu.exec(event.globalPos())

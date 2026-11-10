@@ -2,7 +2,6 @@
 UI tests for the Time tab, status-bar timer, Workload view, Team dialog,
 Timesheet dialog, and main-window timer integration.
 """
-import os
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -12,7 +11,6 @@ from PySide6.QtWidgets import QApplication, QCheckBox, QLabel
 
 from kanbanmanager import DatabaseService
 from kanbanmanager.core.time_tracker import TimeTracker
-from kanbanmanager.database.connection import DatabaseManager
 from kanbanmanager.database.demo_board import DEMO_BOARD_NAME
 from kanbanmanager.enums import ViewMode
 from kanbanmanager.ui import MainWindow
@@ -22,18 +20,12 @@ from kanbanmanager.ui.components.timer_widget import TimerWidget
 from kanbanmanager.ui.dialogs.task_dialog import TaskDialog
 from kanbanmanager.ui.dialogs.timesheet_dialog import TimesheetDialog
 from kanbanmanager.ui.views.workload_view import TeamDialog, WorkloadView
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    os.environ["QT_QPA_PLATFORM"] = "offscreen"
-    return QApplication.instance() or QApplication([])
+from support import seeded_manager
 
 
 @pytest.fixture
 def demo(qapp, tmp_path):
-    mgr = DatabaseManager(tmp_path / "tt_ui.db")
-    mgr.init_database(seed_defaults=True)
+    mgr = seeded_manager(tmp_path / "tt_ui.db")
     service = DatabaseService(mgr, actor="Marcus Chen")
     board = [b for b in service.get_workspaces()[0].boards if b.name == DEMO_BOARD_NAME][0]
     tasks = {t.title: t for t in service.get_tasks_for_board(board.id)}
@@ -126,7 +118,7 @@ def test_task_dialog_assignee_and_time_tab(demo):
     service, board, tasks = demo
     task = tasks["✏️ Your turn: edit this card"]
     dlg = TaskDialog(board_id=board.id, task_id=task.id, service=service)
-    assert dlg.assignee_combo.currentText() == ""
+    assert task.assignee and dlg.assignee_combo.currentText() == task.assignee, "the demo assigns it to you"
     assert dlg.assignee_combo.findText("Elena Rossi") >= 0
     dlg.assignee_combo.setCurrentText("Priya Sharma")
     dlg.time_panel.duration_input.setText("1h")
@@ -134,7 +126,7 @@ def test_task_dialog_assignee_and_time_tab(demo):
     assert dlg.external_changes and dlg.tabs.tabText(dlg._time_tab) == "Time (1h)"
     dlg._save_task()
     assert service.get_task(task.id).assignee == "Priya Sharma"
-    assert service.get_task_activity(task.id)[-1]["details"] == "Assigned to Priya Sharma"
+    assert service.get_task_activity(task.id)[-1]["details"] == f"Reassigned from {task.assignee} to Priya Sharma"
 
 
 # ---------------------------------------------------------------------------

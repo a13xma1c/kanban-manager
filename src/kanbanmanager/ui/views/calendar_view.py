@@ -18,6 +18,9 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QFrame,
     QSizePolicy,
+    QToolButton,
+    QMenu,
+    QFileDialog,
 )
 
 from kanbanmanager.core.signals import app_signals
@@ -84,24 +87,28 @@ class CalendarDayCell(QFrame):
         chip = QPushButton(f"{'✓ ' if is_completed else ''}{title}")
         chip.setFixedHeight(22)
         chip.setCursor(Qt.PointingHandCursor)
+        chip.setToolTip(title)
+        # long titles are clipped instead of widening their day (all days stay the same width)
+        chip.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        chip.setMinimumWidth(0)
 
         if is_completed:
             chip.setStyleSheet(
-                "QPushButton { background-color: #10B98122; color: #10B981; border: 1px solid #10B98144; "
+                "QPushButton { background-color: rgba(16, 185, 129, 34); color: #10B981; border: 1px solid rgba(16, 185, 129, 68); "
                 "border-radius: 4px; text-align: left; padding: 1px 4px; font-size: 10px; } "
-                "QPushButton:hover { background-color: #10B98144; }"
+                "QPushButton:hover { background-color: rgba(16, 185, 129, 68); }"
             )
         elif is_overdue:
             chip.setStyleSheet(
-                "QPushButton { background-color: #EF444422; color: #EF4444; border: 1px solid #EF444466; "
+                "QPushButton { background-color: rgba(239, 68, 68, 34); color: #EF4444; border: 1px solid rgba(239, 68, 68, 102); "
                 "border-radius: 4px; text-align: left; padding: 1px 4px; font-size: 10px; font-weight: bold; } "
-                "QPushButton:hover { background-color: #EF444444; }"
+                "QPushButton:hover { background-color: rgba(239, 68, 68, 68); }"
             )
         else:
             chip.setStyleSheet(
-                "QPushButton { background-color: #3B82F622; color: #38BDF8; border: 1px solid #3B82F644; "
+                "QPushButton { background-color: rgba(59, 130, 246, 34); color: #38BDF8; border: 1px solid rgba(59, 130, 246, 68); "
                 "border-radius: 4px; text-align: left; padding: 1px 4px; font-size: 10px; } "
-                "QPushButton:hover { background-color: #3B82F644; }"
+                "QPushButton:hover { background-color: rgba(59, 130, 246, 68); }"
             )
 
         chip.clicked.connect(lambda: app_signals.task_edit_requested.emit(task_id))
@@ -158,6 +165,21 @@ class CalendarView(QWidget):
         nav_row.addStretch()
         main_layout.addLayout(nav_row)
 
+        self.sync_btn = QPushButton("🔄 Calendar Sync…")
+        self.sync_btn.setToolTip("Subscribe to calendars, publish a live feed, or sync with CalDAV")
+        self.sync_btn.clicked.connect(self._request_sync)
+        nav_row.addWidget(self.sync_btn)
+        self.export_btn = QToolButton()
+        self.export_btn.setText("⬇ Export")
+        self.export_btn.setPopupMode(QToolButton.InstantPopup)
+        export_menu = QMenu(self.export_btn)
+        export_menu.addAction("Calendar file (.ics)…").triggered.connect(self._request_sync)
+        export_menu.addSeparator()
+        export_menu.addAction("This month as PDF…").triggered.connect(self._export_pdf)
+        export_menu.addAction("This month as PNG…").triggered.connect(self._export_png)
+        self.export_btn.setMenu(export_menu)
+        nav_row.addWidget(self.export_btn)
+
         # ---------------------------------------------------------------------
         # Weekday Header Row
         # ---------------------------------------------------------------------
@@ -178,12 +200,33 @@ class CalendarView(QWidget):
         self.grid_layout = QGridLayout(self.grid_container)
         self.grid_layout.setContentsMargins(0, 0, 0, 0)
         self.grid_layout.setSpacing(8)
+        for col in range(7):
+            self.grid_layout.setColumnStretch(col, 1)
 
         main_layout.addWidget(self.grid_container, 1)
 
     def load_board(self, board_id: int) -> None:
         self.current_board_id = board_id
         self.refresh()
+
+    def _request_sync(self, _checked: bool = False) -> None:
+        app_signals.calendar_sync_requested.emit(self.current_board_id or 0)
+
+    def export_month(self, fmt: str, path: Optional[str] = None):
+        from kanbanmanager.ui.reports import export_widget
+
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(self, "Export Calendar", f"{self.current_date:%Y-%m} calendar.{fmt}",
+                                                  "PDF (*.pdf)" if fmt == "pdf" else "PNG (*.png)")
+        if not path:
+            return None
+        return export_widget(self, path, fmt, title=self.current_date.strftime("%B %Y"))
+
+    def _export_pdf(self, _checked: bool = False) -> None:
+        self.export_month("pdf")
+
+    def _export_png(self, _checked: bool = False) -> None:
+        self.export_month("png")
 
     def refresh(self) -> None:
         if not self.current_board_id:

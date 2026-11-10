@@ -2,17 +2,15 @@
 UI tests for the Markdown/WYSIWYG editor, attachments panel, activity panel,
 task dialog integration, task card badges, and demo-board creation.
 """
-import os
 from datetime import datetime
 
 import pytest
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QColor, QImage, QTextCursor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QMessageBox
 
 from kanbanmanager import DatabaseService
-from kanbanmanager.database.connection import DatabaseManager
 from kanbanmanager.database.demo_board import DEMO_BOARD_NAME
 from kanbanmanager.enums import ActivityAction as A
 from kanbanmanager.ui import MainWindow
@@ -27,18 +25,12 @@ from kanbanmanager.ui.components.activity_panel import (
 from kanbanmanager.ui.components.markdown_editor import MarkdownEditor
 from kanbanmanager.ui.components.task_card import TaskCardWidget
 from kanbanmanager.ui.dialogs.task_dialog import TaskDialog
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    os.environ["QT_QPA_PLATFORM"] = "offscreen"
-    return QApplication.instance() or QApplication([])
+from support import seeded_manager
 
 
 @pytest.fixture
 def seeded(qapp, tmp_path):
-    mgr = DatabaseManager(tmp_path / "ui_rich.db")
-    mgr.init_database(seed_defaults=True)
+    mgr = seeded_manager(tmp_path / "ui_rich.db")
     service = DatabaseService(mgr, actor="Ada")
     demo = [b for b in service.get_workspaces()[0].boards if b.name == DEMO_BOARD_NAME][0]
     tasks = {t.title: t for t in service.get_tasks_for_board(demo.id)}
@@ -165,7 +157,7 @@ def test_opening_and_saving_unchanged_task_adds_no_history(seeded):
     before = service.get_task_activity(task.id)
     dlg = TaskDialog(board_id=demo.id, task_id=task.id, service=service)
     assert dlg.attachments_panel.count() == 3
-    assert dlg.activity_panel.comment_count() == 4
+    assert dlg.activity_panel.comment_count() == 5  # incl. the story-point re-estimate note
     dlg._save_task()
     assert service.get_task_activity(task.id) == before
     assert service.get_task(task.id).description == task.description

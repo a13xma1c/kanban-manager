@@ -9,3 +9,11 @@ wheels/
 # Virtual environments
 .venv
 .idea/
+
+# Test artifacts
+.pytest_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.json

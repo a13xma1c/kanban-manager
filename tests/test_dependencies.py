@@ -63,3 +63,16 @@ def test_circular_dependency_prevention(test_service):
     # Self-dependency should also be rejected
     success, err = test_service.add_dependency(task_id=t1.id, depends_on_task_id=t1.id)
     assert success is False
+
+
+def test_dependency_on_a_deleted_task_is_refused_cleanly(test_service):
+    """Found by the model-based test: this used to raise an IntegrityError."""
+    ws = test_service.create_workspace(name="W")
+    board = test_service.create_board(workspace_id=ws.id, name="B")
+    col = test_service.get_columns_for_board(board.id)[0].id
+    a = test_service.create_task(board.id, col, "A")
+    b = test_service.create_task(board.id, col, "B")
+    test_service.delete_task(b.id)
+    assert test_service.add_dependency(a.id, b.id) == (False, "Task not found")
+    assert test_service.add_dependency(b.id, a.id) == (False, "Task not found")
+    assert test_service.get_task(a.id).to_dict()["prerequisites"] == []

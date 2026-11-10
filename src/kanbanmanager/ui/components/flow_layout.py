@@ -5,7 +5,7 @@ badges so a busy card grows taller instead of overflowing its column.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt
 from PySide6.QtWidgets import QLayout, QLayoutItem, QSizePolicy, QWidget
@@ -17,6 +17,9 @@ class FlowLayout(QLayout):
         self._items: List[QLayoutItem] = []
         self._h = h_spacing
         self._v = v_spacing
+        # heightForWidth() is asked many times per layout pass (every card in a column, for
+        # every candidate width); the answer only changes when the items do
+        self._height_cache: Dict[int, int] = {}
         self.setContentsMargins(0, 0, 0, 0)
 
     def __del__(self):
@@ -26,6 +29,7 @@ class FlowLayout(QLayout):
     # QLayout interface ---------------------------------------------------
     def addItem(self, item: QLayoutItem) -> None:
         self._items.append(item)
+        self._height_cache.clear()
 
     def count(self) -> int:
         return len(self._items)
@@ -34,7 +38,13 @@ class FlowLayout(QLayout):
         return self._items[index] if 0 <= index < len(self._items) else None
 
     def takeAt(self, index: int) -> Optional[QLayoutItem]:
+        self._height_cache.clear()
         return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def invalidate(self) -> None:
+        """Qt calls this whenever an item's size hint or visibility changes."""
+        self._height_cache.clear()
+        super().invalidate()
 
     def expandingDirections(self) -> Qt.Orientations:
         return Qt.Orientations(0)
@@ -43,7 +53,10 @@ class FlowLayout(QLayout):
         return True
 
     def heightForWidth(self, width: int) -> int:
-        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+        height = self._height_cache.get(width)
+        if height is None:
+            height = self._height_cache[width] = self._do_layout(QRect(0, 0, width, 0), test_only=True)
+        return height
 
     def setGeometry(self, rect: QRect) -> None:
         super().setGeometry(rect)

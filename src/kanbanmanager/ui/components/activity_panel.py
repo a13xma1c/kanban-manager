@@ -58,6 +58,7 @@ _ACTION_ICONS = {
     ActivityAction.TIME_LOGGED.value: "⏱",
     ActivityAction.TIME_ENTRY_UPDATED.value: "⏱",
     ActivityAction.TIME_ENTRY_DELETED.value: "⏱",
+    ActivityAction.BOARD_UPDATED.value: "🧩",
 }
 
 # Field edits whose old/new text is worth showing as a diff
@@ -402,7 +403,7 @@ class ActivityPanel(QWidget):
         row = QHBoxLayout(w)
         row.setContentsMargins(6, 2, 6, 2)
         row.setSpacing(8)
-        icon = QLabel(_ACTION_ICONS.get(a["action_type"], "•"))
+        icon = QLabel("🧩" if a.get("field_name") == "custom_field" else _ACTION_ICONS.get(a["action_type"], "•"))
         icon.setFixedWidth(22)
         icon.setAlignment(Qt.AlignCenter)
         row.addWidget(icon, 0, Qt.AlignTop)
